@@ -19,7 +19,7 @@ export interface Diagnostic {
     readonly range: SourceRange;
 }
 export interface Region extends SourceRange {
-    readonly kind: 'expression' | 'cursorExpression' | 'cursor' | 'argument' | 'compactText';
+    readonly kind: 'expression' | 'cursorExpression' | 'cursor' | 'argument';
 }
 export interface SnippetReference extends SourceRange {
     readonly name: string;

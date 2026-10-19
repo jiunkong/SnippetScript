@@ -370,17 +370,12 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
     const body = (frame: Frame) => new SnippetTemplate(state.source, frame.nodes);
     let position = 0;
     let compactDepth = 0;
-    let literalStart = inputMap[0] ?? 0;
-    const sourceEnd = inputMap.length ? inputMap.at(-1)! + 1 : literalStart;
     while (position < text.length) {
         let start = text.indexOf('{{', position);
         while (start !== -1 && text[start + 2] === '{')
             start = text.indexOf('{{', start + 1);
         if (start === -1)
             start = text.length;
-        const literalEnd = start < text.length ? map[start] : sourceEnd;
-        if (compactDepth > 0 && literalEnd > literalStart)
-            state.regions.push({ start: literalStart, end: literalEnd, kind: 'compactText' });
         let frame = stack.at(-1)!;
         if (start > position) {
             const range = rangeOf(map, position, start);
@@ -391,10 +386,8 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
                 ? literal.replace(/(?:\r\n|\r|\n)[\t ]*/g, '') : literal;
             frame.nodes.push({ type: 'text', value, range, offset: range.start });
         }
-        if (start === text.length) {
-            literalStart = literalEnd;
+        if (start === text.length)
             break;
-        }
         let end = start + 2;
         let unclosedQuote = false;
         try {
@@ -418,7 +411,6 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
                 end = text.length;
             }
             const range = rangeOf(map, start, Math.min(end + 2, text.length));
-            literalStart = closed ? range.end : sourceEnd;
             position = closed ? end + 2 : end;
             const content = text.slice(start + 2, end), tag = content.trim();
             const tagStart = start + 2 + content.indexOf(tag), tagEnd = tagStart + tag.length;
@@ -585,10 +577,6 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
                 position = Math.min(end + 2, text.length);
         }
     }
-    // Continuation normalization may consume the entire final text segment.
-    // Highlight its original source even though it has no executable text node.
-    if (compactDepth > 0 && literalStart < sourceEnd)
-        state.regions.push({ start: literalStart, end: sourceEnd, kind: 'compactText' });
     for (const frame of stack.slice(1))
         report(state, createSnippetError(({ if: 'err_if_unclosed', for: 'err_for_unclosed', switch: 'err_switch_unclosed', case: 'err_case_unclosed', default: 'err_default_unclosed', compact: 'err_compact_unclosed' } as Record<string, string>)[frame.type]), frame.range);
     return body(root);

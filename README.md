@@ -45,8 +45,6 @@ The same `Analysis` is accepted by `execute()` and can be rendered by any host h
 
 Compact blocks may nest and wrap conditionals or loops. They add no variable scope: declarations and assignments behave as if the compact markers were absent. The analyzer applies formatting to literal text nodes and retains original UTF-16 token and diagnostic ranges; execution does not trim generated output. A fragment literal or called snippet applies compact formatting only if its own source contains a compact block.
 
-`Analysis.regions` includes `compactText` ranges for literal source inside compact blocks, including indentation and removed line continuations. Nested blocks do not duplicate those ranges, and template tags are excluded. Hosts can use these ranges to mark compact text without parsing block syntax themselves; ranges inside fragment literals still belong to the enclosing expression tag for presentation purposes.
-
 `newline()` takes no arguments and returns a string containing one LF (`\n`). Use `{{newline()}}` to insert a line break, including within compact blocks, or store its result and compose it in expressions.
 
 ## Variable type inference

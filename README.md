@@ -143,6 +143,8 @@ const fragment = await execute(analysis, {
 
 `toast(message, color[, seconds])` returns `undefined` after host dispatch succeeds (direct template output inserts no text); it is not a success flag and does not wait for the display interval. The optional duration must be finite, greater than zero, and at most `MAX_TOAST_DURATION_SECONDS` (2147483.647, the browser timer limit). It defaults to `DEFAULT_TOAST_DURATION_SECONDS` (6). The core validates an explicit duration before host dispatch; the browser host validates CSS color and displays the toast. Invalid types, invalid duration, invalid color, missing host capabilities or host errors propagate as failures. Later toasts replace earlier ones, and the page can remove the display, so visible duration is not guaranteed. Fractional seconds are supported, rounded to milliseconds with a minimum timer delay of 1 ms.
 
+`copy(text)` accepts a string or fragment and returns `undefined` after the host successfully writes it to the clipboard, including when an older host returns a string. Direct template output inserts no text. Clipboard write failures remain errors.
+
 The public `FUNCTIONS` registry owns overloads, argument counts, semantic token categories, execution handlers, additional value validation, return inference and host policies. Hosts implement `prompt`, `choice`, `toast`, `copy`, `paste`, `url`, `domain`, and `title`. Missing capabilities fail when invoked. Calls skipped by `&&`, `||` or a ternary are never invoked, including calls and effects inside fragment literals. Arguments are evaluated left to right.
 
 ### Adding a builtin

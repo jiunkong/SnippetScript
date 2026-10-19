@@ -9,7 +9,7 @@ export function engine() {
       case 'choice': return context.showSnippetChoice?.(String(args[0] || 'Select Option:'), args.slice(1));
       case 'toast': context.showSnippetToast?.(...args); return '';
       case 'paste': return context.navigator?.clipboard.readText();
-      case 'copy': await context.navigator?.clipboard.writeText(String(args[0] ?? '')); return '';
+      case 'copy': await context.navigator?.clipboard.writeText(String(args[0] ?? '')); return undefined;
       default: throw new core.SnippetError('err_host_function_unavailable', [name]);
     }
   }};

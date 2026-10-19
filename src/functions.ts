@@ -429,12 +429,12 @@ export const FUNCTIONS = defineFunctions({
     },
     copy: {
         overloads: [
-            overload([string('text')], ['string']),
-            overload([parameter('text', ['fragment'])], ['string']),
+            overload([string('text')], ['undefined']),
+            overload([parameter('text', ['fragment'])], ['undefined']),
         ],
         arityError: 'err_fn_one_arg_exact',
         host: true,
-        executeAsync: host({ failure: () => { throw createSnippetError('err_clipboard_copy_failed'); } }),
+        executeAsync: host({ result: () => undefined, failure: () => { throw createSnippetError('err_clipboard_copy_failed'); } }),
     },
     type: {
         overloads: [

@@ -41,11 +41,11 @@ The same `Analysis` is accepted by `execute()` and can be rendered by any host h
 
 ## Compact formatting
 
-`{{compact}} … {{endcompact}}` removes literal source line breaks (LF, CRLF or CR) and the spaces/tabs immediately after them. It preserves ordinary text, inline whitespace, and whitespace outside the block. Newlines produced by expressions, strings, fragment literals and snippet calls remain intact; use `{{"\n"}}` to insert one explicitly.
+`{{compact}} … {{endcompact}}` removes literal source line breaks (LF, CRLF or CR) and the spaces/tabs immediately after them. It preserves ordinary text, inline whitespace, and whitespace outside the block. Newlines produced by expressions, strings, fragment literals and snippet calls remain intact; use `{{newline()}}` to insert one explicitly.
 
 Compact blocks may nest and wrap conditionals or loops. They add no variable scope: declarations and assignments behave as if the compact markers were absent. The analyzer applies formatting to literal text nodes and retains original UTF-16 token and diagnostic ranges; execution does not trim generated output. A fragment literal or called snippet applies compact formatting only if its own source contains a compact block.
 
-`newline()` takes no arguments and returns a string containing one LF (`\n`). Use `{{newline()}}` to insert a line break, including within compact blocks, or store its result and compose it in expressions.
+`newline()` and its alias `nl()` take no arguments and return a string containing one LF (`\n`). Use `{{newline()}}` to insert a line break, including within compact blocks, or store its result and compose it in expressions.
 
 ## Variable type inference
 

@@ -15,9 +15,39 @@ export interface ParsedCall extends ParsedName {
     offsetOpenStart?: number;
     offsetCloseEnd?: number;
 }
-export function snippetParameterNames(trigger?: string) {
-    return [...String(trigger || '').matchAll(/\$\{([^:}]+)(?::([^}]+))?\}/g)].map(match => match[1]);
+
+// Decode values only after scanning their original source spelling. Unknown
+// escapes stay intact, so regex text such as \d does not lose its backslash.
+const STRING_ESCAPES: Readonly<Record<string, string>> = Object.freeze({
+    '"': '"', "'": "'", '\\': '\\', n: '\n', t: '\t',
+});
+export interface StringEscape {
+    readonly start: number;
+    readonly end: number;
+    readonly value: string;
 }
+export function scanSnippetStringEscapes(token: string): StringEscape[] {
+    const escapes: StringEscape[] = [];
+    for (let i = 1; i < token.length - 1; i++) {
+        if (token[i] === '\\' && i + 1 < token.length - 1) {
+            const next = token[++i];
+            if (Object.prototype.hasOwnProperty.call(STRING_ESCAPES, next))
+                escapes.push({ start: i - 1, end: i + 1, value: STRING_ESCAPES[next] });
+        }
+    }
+    return escapes;
+}
+export function decodeSnippetStringLiteral(token: string, escapes: readonly StringEscape[] = scanSnippetStringEscapes(token)): string {
+    const parts: string[] = [];
+    let from = 1;
+    for (const escape of escapes) {
+        parts.push(token.slice(from, escape.start), escape.value);
+        from = escape.end;
+    }
+    parts.push(token.slice(from, -1));
+    return parts.join('');
+}
+
 // Read an entire quoted value. Backtick fragments may contain template tags,
 // whose expressions can themselves contain quoted values or nested fragments.
 export function scanSnippetQuotedValue(text: string, start: number, execution?: {

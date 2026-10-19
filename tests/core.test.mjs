@@ -178,12 +178,12 @@ test('invalid analysis is rejected before effects and future warnings do not blo
   assert.equal(String(await execute(withWarning)),'ok');
 });
 
-test('trigger analysis exposes semantic tokens without compiling browser trigger matching', () => {
+test('trigger analysis exposes semantic tokens and accepts the default capture regex', () => {
   const source='/hello ${name:[a-z]+:i}';
   const analysis=analyzeTrigger(source);
   assert.equal(source.slice(analysis.tokens.find(token=>token.kind==='regex').start,analysis.tokens.find(token=>token.kind==='regex').end),'[a-z]+');
   assert.ok(analysis.tokens.some(token=>token.kind==='regexFlag'));
-  assert.equal(analyzeTrigger('${name}').diagnostics[0].code,'err_trigger_arg_regex_required');
+  assert.deepEqual(analyzeTrigger('${name}').diagnostics,[]);
 });
 
 test('compiled core modules have no extension or DOM dependencies', async () => {

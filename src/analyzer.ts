@@ -1,7 +1,10 @@
-import type { Analysis, AnalyzeOptions, Assignment, Diagnostic, Expr, HighlightToken, Region, SnippetReference, SourceRange, TemplateNode, TokenKind } from './types.js';
+import { inferTemplateTypes } from './inference.js';
+import { snippetParameterNames } from './trigger.js';
+export { analyzeTrigger } from './trigger.js';
+import type { Analysis, AnalyzeOptions, Assignment, CallSignature, Diagnostic, Expr, HighlightToken, Region, SnippetReference, SourceRange, TemplateNode, TokenKind } from './types.js';
 import { SnippetError, createSnippetError } from './errors.js';
-import { decodeSnippetFragmentLiteral, parseSnippetCall, scanSnippetQuotedValue, snippetParameterNames } from './scanner.js';
-import { FUNCTIONS, validateFunction } from './functions.js';
+import { decodeSnippetFragmentLiteral, decodeSnippetStringLiteral, scanSnippetStringEscapes, parseSnippetCall, scanSnippetQuotedValue } from './scanner.js';
+import { FUNCTIONS, validateFunction, SNIPPET_PARAMETER_TYPES, resolveFunctionOverloads } from './functions.js';
 export class SnippetTemplate {
     readonly source: string;
     readonly nodes: readonly TemplateNode[];
@@ -23,6 +26,7 @@ interface State {
     diagnostics: Diagnostic[];
     regions: Region[];
     references: SnippetReference[];
+    calls: { kind: 'function' | 'snippet'; name: string; range: SourceRange; callRange?: SourceRange; argumentStarts?: number[]; complete?: boolean }[];
 }
 const own = (object: object, key: PropertyKey) => Object.prototype.hasOwnProperty.call(object, key);
 const cloneScope = (scope: Scope): Scope => ({ ...scope, variables: new Set(scope.variables) });
@@ -32,7 +36,9 @@ function rangeOf(map: readonly number[], start: number, end: number): SourceRang
 function token(state: State, kind: TokenKind, range: SourceRange) { if (range.end > range.start)
     state.tokens.push({ ...range, kind }); }
 function report(state: State, error: any, fallback: SourceRange) {
-    state.diagnostics.push(Object.freeze({ code: error.code || error.messageKey || 'err_template_syntax', args: Object.freeze(error.args || error.messageValues || []), severity: 'error', range: Object.freeze(error.range || fallback) }));
+    const code = error.code || error.messageKey || 'err_template_syntax', range = error.range || fallback;
+    if (state.diagnostics.some(diagnostic => diagnostic.code === code && diagnostic.range.start === range.start && diagnostic.range.end === range.end)) return;
+    state.diagnostics.push(Object.freeze({ code, args: Object.freeze(error.args || error.messageValues || []), severity: 'error', range: Object.freeze(range) }));
 }
 function fail(code: string, range: SourceRange, args: unknown[] = []): never { throw new SnippetError(code, args, range); }
 const precedences: Record<string, number> = { '~': 1, '||': 2, '&&': 3, '==': 4, '!=': 4, '>': 4, '<': 4, '>=': 4, '<=': 4, '+': 5, '-': 5, '*': 6, '/': 6, '%': 6 };
@@ -56,8 +62,12 @@ class ExpressionParser {
             return { text: '', start, end: start, type: 'eof' };
         if (char === '"' || char === "'" || char === '`') {
             const scan = scanSnippetQuotedValue(this.text, start);
-            if (scan.error !== undefined)
-                fail(scan.error, this.range(scan.offset ?? start, this.text.length));
+            if (scan.error !== undefined) {
+                const range = this.range(scan.offset ?? start, this.text.length);
+                report(this.state, new SnippetError(scan.error, [], range), range);
+                this.position = this.text.length;
+                return { text: this.text.slice(start), start, end: this.position, type: char === '`' ? 'fragment' : 'string', data: { incomplete: true } };
+            }
             this.position = scan.end!;
             return { text: this.text.slice(start, this.position), start, end: this.position, type: char === '`' ? 'fragment' : 'string' };
         }
@@ -80,11 +90,12 @@ class ExpressionParser {
         this.position += ['==', '!=', '<=', '>=', '&&', '||'].includes(two) ? 2 : 1;
         return { text: this.text.slice(start, this.position), start, end: this.position, type: 'punctuation' };
     }
+    at(text: string): boolean { return this.current.text === text; }
     advance() { const item = this.current; this.current = this.next(); return item; }
     mark(item: Lex, kind: TokenKind) { token(this.state, kind, this.range(item.start, item.end)); }
-    expected(text: string, code = 'err_missing_operand') {
+    expected(text: string, code = 'err_missing_operand', missingRange?: SourceRange) {
         if (this.current.text !== text)
-            fail(this.current.text === ']' && text === ')' ? 'err_list_syntax' : code, this.range(this.current.start, this.current.end), ['err_list_syntax', 'err_list_index_integer'].includes(code) || this.current.text === ']' && text === ')' ? [] : [this.text]);
+            fail(this.current.text === ']' && text === ')' ? 'err_list_syntax' : code, this.current.type === 'eof' && missingRange ? missingRange : this.range(this.current.start, this.current.end), ['err_list_syntax', 'err_list_index_integer'].includes(code) || this.current.text === ']' && text === ')' ? [] : [this.text]);
         return this.advance();
     }
     parse(min = 0): Expr {
@@ -97,7 +108,7 @@ class ExpressionParser {
                 if (this.current.text === ']' || this.current.text === ',')
                     fail('err_list_index_integer', this.range(next.start, this.current.end));
                 const index = this.parse();
-                const close = this.expected(']', 'err_list_index_integer');
+                const close = this.expected(']', 'err_list_index_integer', this.range(next.start, this.text.length));
                 this.mark(close, 'list');
                 if (left.kind === 'literal' && typeof left.value !== 'string')
                     report(this.state, createSnippetError('err_list_index_target'), left.range);
@@ -122,7 +133,7 @@ class ExpressionParser {
             if (next.text === '~' && left.kind === 'binary' && left.operator === '~')
                 fail('err_range_both_values_required', this.range(next.start, next.end), [this.text]);
             this.advance();
-            this.mark(next, 'operator');
+            this.mark(next, next.text === '~' ? 'rangeOperator' : ['+', '-', '*', '/', '%'].includes(next.text) ? 'arithmeticOperator' : 'operator');
             if (['', ')', ']', ',', ':', '~'].includes(this.current.text))
                 fail(next.text === '~' ? 'err_range_both_values_required' : 'err_missing_operand', this.range(next.start, next.end), [this.text]);
             const right = this.parse(precedence + 1);
@@ -151,8 +162,13 @@ class ExpressionParser {
         const item = this.advance(), range = this.range(item.start, item.end);
         if (item.type === 'number')
             return { kind: 'literal', value: /^0[xXbBoO]/.test(item.text) ? parseFloat(item.text) : Number(item.text), range };
-        if (item.type === 'string')
-            return { kind: 'literal', value: item.text.slice(1, -1), range };
+        if (item.type === 'string') {
+            if (item.data?.incomplete) return { kind: 'literal', value: '', range };
+            const escapes = scanSnippetStringEscapes(item.text);
+            for (const escape of escapes)
+                token(this.state, 'stringEscape', this.range(item.start + escape.start, item.start + escape.end));
+            return { kind: 'literal', value: decodeSnippetStringLiteral(item.text, escapes), range };
+        }
         if (item.type === 'variable') {
             this.mark(item, 'variable');
             const name = item.text.slice(1);
@@ -161,6 +177,7 @@ class ExpressionParser {
             return { kind: 'variable', name, range };
         }
         if (item.type === 'fragment') {
+            if (item.data?.incomplete) { this.mark({ ...item, end: item.start + 1 }, 'fragmentDelimiter'); return { kind: 'fragment', template: new SnippetTemplate(this.state.source, []), range }; }
             this.mark({ ...item, end: item.start + 1 }, 'fragmentDelimiter');
             this.mark({ ...item, start: item.end - 1 }, 'fragmentDelimiter');
             const decoded = decodeSnippetFragmentLiteral(item.text);
@@ -171,8 +188,11 @@ class ExpressionParser {
         }
         if (item.type === 'snippet') {
             const call = item.data;
+            const reference = { kind: 'snippet' as const, name: call.name, range: this.range(item.start, call.nameEnd), callRange: range, argumentStarts: [this.range(call.argsStart - 1, call.argsStart).end] };
+            this.state.calls.push(reference);
             token(this.state, 'snippetFunction', this.range(item.start, call.nameEnd));
             const args = this.subArguments(call.argsStart, call.argsEnd);
+            reference.argumentStarts.push(...args.slice(1).map(arg => arg.range.start));
             for (const index of [call.argsStart - 1, call.argsEnd, call.offsetOpenStart, call.offsetEnd]) {
                 if (index !== undefined && index !== null)
                     token(this.state, 'snippetFunction', this.range(index, index + 1));
@@ -201,23 +221,23 @@ class ExpressionParser {
             return { kind: 'snippet', name: call.name, args, offset, range };
         }
         if (item.text === '(') {
-            token(this.state, 'syntax', range);
+            token(this.state, 'parenthesis', range);
             if (this.current.text === ')')
                 fail('err_missing_operand', range, ['()']);
             const node = this.parse();
-            const close = this.expected(')', 'err_unmatched_open_paren');
-            this.mark(close, 'syntax');
+            const close = this.expected(')', 'err_unmatched_open_paren', this.range(item.start, this.text.length));
+            this.mark(close, 'parenthesis');
             return node;
         }
         if (item.text === '[') {
             this.mark(item, 'list');
             const items = this.arguments(']', 'err_list_syntax');
-            const close = this.expected(']', 'err_list_syntax');
+            const close = this.expected(']', 'err_list_syntax', this.range(item.start, this.text.length));
             this.mark(close, 'list');
             return { kind: 'list', items, range: { start: range.start, end: this.range(close.start, close.end).end } };
         }
         if (item.text === '+' || item.text === '-') {
-            this.mark(item, 'operator');
+            this.mark(item, 'arithmeticOperator');
             const operand = this.parse(7);
             return { kind: 'unary', operator: item.text, operand, range: { start: range.start, end: operand.range.end } };
         }
@@ -226,26 +246,46 @@ class ExpressionParser {
         if (item.type === 'identifier') {
             if (this.current.text === '(') {
                 const open = this.advance();
+                const reference = { kind: 'function' as const, name: item.text, range, callRange: range, argumentStarts: [this.range(open.start, open.end).end], complete: false };
+                this.state.calls.push(reference);
                 const spec = own(FUNCTIONS, item.text) ? FUNCTIONS[item.text] : undefined;
                 token(this.state, spec?.kind || 'function', this.range(item.start, open.end));
-                let args: Expr[];
-                try {
-                    args = this.arguments(')', 'err_function_arguments');
+                const args: Expr[] = [];
+                let malformed = false;
+                if (!this.at(')')) {
+                    while (true) {
+                        try {
+                            if (this.current.type === 'eof' || this.at(',') || this.at(')'))
+                                fail('err_function_arguments', this.range(this.current.start, this.current.end));
+                            args.push(this.parse());
+                        } catch (error) {
+                            malformed = true;
+                            if (error.code === 'err_function_arguments') {
+                                try { validateFunction(item.text, 0, true); }
+                                catch (validationError) { error = new SnippetError(validationError.code, validationError.args,
+                                    this.current.type === 'eof' ? this.range(item.start, this.text.length) : error.range); }
+                            }
+                            report(this.state, error, this.range(item.start, this.text.length));
+                            break;
+                        }
+                        if (!this.at(',')) break;
+                        const comma = this.advance();
+                        this.mark(comma, 'syntax');
+                        reference.argumentStarts.push(this.range(comma.start, comma.end).end);
+                    }
                 }
-                catch (error) {
-                    if (error.code === 'err_function_arguments')
-                        validateFunction(item.text, 0, true);
-                    throw error;
+                const close = this.at(')') ? this.advance() : undefined;
+                if (close) this.mark(close, spec?.kind || 'function');
+                else if (!malformed) report(this.state, createSnippetError('err_unmatched_open_paren', [this.text]), this.range(item.start, this.text.length));
+                const callRange = { start: range.start, end: close ? this.range(close.start, close.end).end : this.range(item.start, this.text.length).end };
+                reference.callRange = callRange;
+                reference.complete = !!close;
+                if (!malformed) {
+                    try { validateFunction(item.text, args.length); }
+                    catch (error) { report(this.state, error, callRange); }
                 }
-                const close = this.expected(')', 'err_unmatched_open_paren');
-                this.mark(close, spec?.kind || 'function');
-                try {
-                    validateFunction(item.text, args.length);
-                }
-                catch (error) {
-                    report(this.state, error, range);
-                }
-                return { kind: 'call', name: item.text, args, range: { start: range.start, end: this.range(close.start, close.end).end } };
+                if (malformed && !close) { this.position = this.text.length; this.current = this.next(); }
+                return { kind: 'call', name: item.text, args, range: callRange };
             }
             if (item.text === 'index' || item.text === 'value') {
                 this.mark(item, 'variable');
@@ -254,8 +294,7 @@ class ExpressionParser {
                 return { kind: 'loop', name: item.text, range };
             }
             if (['true', 'false', 'null', 'undefined'].includes(item.text)) {
-                if (item.text !== 'undefined')
-                    this.mark(item, item.text === 'null' ? 'null' : 'bool');
+                this.mark(item, item.text === 'null' || item.text === 'undefined' ? 'null' : 'bool');
                 return { kind: 'literal', value: item.text === 'true' ? true : item.text === 'false' ? false : item.text === 'null' ? null : undefined, range };
             }
             fail('err_unknown_tag', range, [item.text]);
@@ -282,6 +321,7 @@ class ExpressionParser {
     }
 }
 function expression(text: string, map: readonly number[], state: State, scope: Scope): Expr {
+    if (!text.trim()) fail('err_expression_required', rangeOf(map, 0, map.length));
     const parser = new ExpressionParser(text, map, state, scope);
     const result = parser.parse();
     if (parser.current.type !== 'eof') {
@@ -291,7 +331,7 @@ function expression(text: string, map: readonly number[], state: State, scope: S
     return result;
 }
 export function parseExpression(source: string): Expr {
-    const state: State = { source, options: { checkVariables: false, forDepth: 1 }, tokens: [], diagnostics: [], regions: [], references: [] };
+    const state: State = { source, options: { checkVariables: false, forDepth: 1 }, tokens: [], diagnostics: [], regions: [], references: [], calls: [] };
     const node = expression(source, Array.from({ length: source.length }, (_, i) => i), state, { variables: new Set(), forDepth: 1, breakDepth: 0 });
     if (state.diagnostics.length) {
         const d = state.diagnostics[0];
@@ -343,25 +383,37 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
         if (start === text.length)
             break;
         let end = start + 2;
+        let unclosedQuote = false;
         try {
             while (end < text.length && !text.startsWith('}}', end)) {
                 if (['"', "'", '`'].includes(text[end])) {
                     const quoted = scanSnippetQuotedValue(text, end);
-                    if (quoted.error)
-                        fail(quoted.error, rangeOf(map, start, text.length));
+                    if (quoted.error) {
+                        unclosedQuote = true;
+                        report(state, createSnippetError(quoted.error), rangeOf(map, end, text.length));
+                        end = text.length;
+                        break;
+                    }
                     end = quoted.end!;
                 }
                 else
                     end++;
             }
-            if (end >= text.length - 1)
-                fail('err_template_unclosed_tag', rangeOf(map, start, text.length));
-            const range = rangeOf(map, start, end + 2);
-            position = end + 2;
+            const closed = end < text.length - 1 && text.startsWith('}}', end);
+            if (!closed) {
+                if (!unclosedQuote) report(state, createSnippetError('err_template_unclosed_tag'), rangeOf(map, start, text.length));
+                end = text.length;
+            }
+            const range = rangeOf(map, start, Math.min(end + 2, text.length));
+            position = closed ? end + 2 : end;
             const content = text.slice(start + 2, end), tag = content.trim();
             const tagStart = start + 2 + content.indexOf(tag), tagEnd = tagStart + tag.length;
-            const expr = (from: number, to = tagEnd) => expression(text.slice(from, to), map.slice(from, to), state, frame.scope);
-            const syntax = (cursor = false) => { token(state, cursor ? 'cursorSyntax' : 'syntax', rangeOf(map, start, start + 2)); token(state, cursor ? 'cursorSyntax' : 'syntax', rangeOf(map, end, end + 2)); };
+            const missingExpressionRange = (from: number) => rangeOf(map, from < end ? from : tagStart, from < end ? end : tagEnd);
+            const expr = (from: number, to = end) => {
+                if (!text.slice(from, to).trim()) fail('err_expression_required', missingExpressionRange(from));
+                return expression(text.slice(from, to), map.slice(from, to), state, frame.scope);
+            };
+            const syntax = (cursor = false) => { token(state, cursor ? 'cursorSyntax' : 'syntax', rangeOf(map, start, start + 2)); if (closed) token(state, cursor ? 'cursorSyntax' : 'syntax', rangeOf(map, end, end + 2)); };
             const node = (value: any) => frame.nodes.push({ ...value, range, offset: range.start });
             if (!tag)
                 fail('err_unknown_tag', range, ['']);
@@ -373,15 +425,18 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
                 let from = tagStart + type.length;
                 while (/\s/.test(text[from] || '') && from < tagEnd)
                     from++;
-                if (from < tagEnd)
-                    state.regions.push({ ...rangeOf(map, from, tagEnd), kind: 'expression' });
+                // Include leading, keyword-separating and trailing whitespace
+                // so hosts can draw a continuous tag background and underline.
+                state.regions.push({ ...rangeOf(map, start + 2, end), kind: 'expression' });
                 if (['if', 'for', 'switch', 'case'].includes(type)) {
                     if (type === 'case' && frame.type !== 'switch')
                         fail('err_template_syntax', range, [tag]);
+                    if (from >= tagEnd)
+                        fail(type === 'if' ? 'err_condition_required' : 'err_tag_expression_required', missingExpressionRange(from), [type]);
                     const scope = cloneScope(frame.scope);
                     const expressions: Expr[] = [];
                     if (type === 'case') {
-                        const parser = new ExpressionParser(text.slice(from, tagEnd), map.slice(from, tagEnd), state, frame.scope);
+                        const parser = new ExpressionParser(text.slice(from, end), map.slice(from, end), state, frame.scope);
                         while (parser.current.type !== 'eof') {
                             expressions.push(parser.parse());
                             if (parser.current.type === 'eof')
@@ -401,6 +456,8 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
                 else if (type === 'elif' || type === 'else') {
                     if (frame.type !== 'if' || frame.hasElse)
                         fail('err_elif_else_outside_if', range);
+                    if (type === 'elif' && from >= tagEnd)
+                        fail('err_condition_required', missingExpressionRange(from), [type]);
                     frame.branches!.push({ expression: frame.expression ?? null, body: body(frame), range: frame.range });
                     frame.nodes = [];
                     frame.scope = cloneScope(stack.at(-2)!.scope);
@@ -438,7 +495,7 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
                     node({ type });
                 }
                 else if (type === 'set') {
-                    const parser = new ExpressionParser(text.slice(from, tagEnd), map.slice(from, tagEnd), state, frame.scope);
+                    const parser = new ExpressionParser(text.slice(from, end), map.slice(from, end), state, frame.scope);
                     const assignments: Assignment[] = [];
                     while (parser.current.type !== 'eof') {
                         const name = parser.advance();
@@ -459,14 +516,14 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
                             token(state, 'operator', parser.range(op.start, parser.current.start));
                             value = parser.parse();
                         }
-                        assignments.push({ name: name.text.slice(1), operator, expression: value });
+                        assignments.push({ range: parser.range(name.start, name.end), name: name.text.slice(1), operator, expression: value });
                         frame.scope.variables.add(name.text.slice(1));
                         if (parser.current.type === 'eof')
                             break;
                         const comma = parser.expected(',', 'err_template_syntax');
                         parser.mark(comma, 'syntax');
                         if (parser.current.type === 'eof')
-                            fail('err_template_syntax', range, [tag]);
+                            fail('err_template_syntax', rangeOf(map, from + comma.start, end), [tag]);
                     }
                     if (!assignments.length)
                         fail('err_template_syntax', range, [tag]);
@@ -475,7 +532,11 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
             }
             else if (tag === 'cursor' || /^#\s*(cursor|\d+)$/.test(tag)) {
                 syntax(true);
-                token(state, 'cursor', rangeOf(map, tagStart, tagEnd));
+                if (/^#\s*\d+$/.test(tag)) {
+                    // As with ordinary numeric literals, leave the digits
+                    // uncolored. Only the cursor marker has a syntax token.
+                    token(state, 'cursorSyntax', rangeOf(map, tagStart, tagStart + 1));
+                } else token(state, 'cursor', rangeOf(map, tagStart, tagEnd));
                 state.regions.push({ ...range, kind: 'cursor' });
                 const level = tag === 'cursor' || /^#\s*cursor$/.test(tag) ? 0 : Number(tag.slice(1).trim());
                 if (!Number.isSafeInteger(level) || level < 0)
@@ -487,7 +548,7 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
                 syntax(cursor);
                 if (cursor)
                     token(state, 'cursorSyntax', rangeOf(map, tagStart, tagStart + 1));
-                state.regions.push({ ...rangeOf(map, cursor ? tagStart + 1 : start + 2, end), kind: cursor ? 'cursorExpression' : 'expression' });
+                state.regions.push({ ...rangeOf(map, start + 2, end), kind: cursor ? 'cursorExpression' : 'expression' });
                 node({ type: cursor ? 'cursorExpression' : 'expression', expression: expr(tagStart + (cursor ? 1 : 0)) });
             }
         }
@@ -510,38 +571,40 @@ function deepFreeze<T>(value: T): T {
     return value;
 }
 export function analyze(source: string, options: AnalyzeOptions = {}): Analysis {
-    const state: State = { source, options, tokens: [], diagnostics: [], regions: [], references: [] };
-    const template = parseBody(source, Array.from({ length: source.length }, (_, i) => i), state, { variables: new Set(options.variables || []), forDepth: options.forDepth || 0, breakDepth: 0 });
+    const state: State = { source, options, tokens: [], diagnostics: [], regions: [], references: [], calls: [] };
+    const template = parseBody(source, Array.from({ length: source.length }, (_, i) => i), state, { variables: new Set([...(options.variables || []), ...Object.keys(options.variableTypes || {})]), forDepth: options.forDepth || 0, breakDepth: 0 });
     // Freeze children even though SnippetTemplate itself was frozen during construction.
     for (const node of template.nodes)
         deepFreeze(node);
     state.tokens.sort((a, b) => a.start - b.start || a.end - b.end);
-    state.diagnostics.sort((a, b) => a.range.start - b.range.start);
-    return deepFreeze({ source, template, tokens: state.tokens, diagnostics: state.diagnostics, references: state.references, regions: state.regions });
-}
-export function analyzeTrigger(source: string): Omit<Analysis, 'template'> {
-    const state: State = { source, options: {}, tokens: [], diagnostics: [], regions: [], references: [] };
-    const regex = /\$\{([^:}]+)(?::((?:[^{}]|\{[^{}]*\})*))?\}/gu;
-    for (const match of source.matchAll(regex)) {
-        const start = match.index!, end = start + match[0].length, name = match[1], inner = match[2];
-        if (!inner) {
-            report(state, createSnippetError('err_trigger_arg_regex_required'), { start, end });
-            continue;
+    const inferred = inferTemplateTypes(template, options);
+    state.diagnostics.push(...inferred.diagnostics.filter(diagnostic => !state.diagnostics.some(existing =>
+        existing.severity === 'error' && existing.range.start < diagnostic.range.end && existing.range.end > diagnostic.range.start)));
+    const callTypes = new Map(inferred.callTypes.map(call => [call.range.start, call]));
+    const callSignatures: CallSignature[] = [];
+    for (const call of state.calls) {
+        if (call.kind === 'function') {
+            const spec = own(FUNCTIONS, call.name) ? FUNCTIONS[call.name] : undefined;
+            if (!spec) continue;
+            const inferredCall = callTypes.get(call.range.start);
+            const resolution = resolveFunctionOverloads(call.name, inferredCall?.argumentTypes ?? []);
+            const candidates = resolution.candidates.length ? resolution.candidates : resolution.fallback;
+            const overloads = candidates.map(overload => ({ id: overload.id,
+                parameters: [...overload.parameters.map((parameter, index) => ({ ...parameter, optional: index >= overload.min })),
+                    ...(overload.restParameter ? [{ ...overload.restParameter, rest: true }] : [])],
+                returnTypes: overload.returnTypes === 'any' && inferredCall && !inferredCall.types.includes('unknown') ? inferredCall.types : overload.returnTypes,
+                returnElementTypes: overload.returnElementTypes ?? (overload.returnTypes === 'any' || overload.returnTypes.includes('list')
+                    ? spec.inferReturn?.(inferredCall?.argumentTypes ?? [], [overload]).elements ?? inferredCall?.elementTypes : undefined) }));
+            callSignatures.push({ ...call, callRange: call.callRange ?? call.range, complete: call.complete ?? true, argumentStarts: call.argumentStarts ?? [], matches: !!resolution.candidates.length,
+                overloads });
+        } else {
+            const targets = options.library?.filter(snippet => snippet.name === call.name);
+            if (targets?.length !== 1) continue;
+            const parameters = snippetParameterNames(targets[0].trigger).map(name => ({ name, types: SNIPPET_PARAMETER_TYPES }));
+            callSignatures.push({ ...call, callRange: call.callRange ?? call.range, complete: call.complete ?? true, argumentStarts: call.argumentStarts ?? [], matches: true,
+                overloads: [{ id: 'snippet:' + call.name, parameters, returnTypes: ['fragment'] }] });
         }
-        token(state, 'syntax', { start, end: start + 2 });
-        token(state, 'variable', { start: start + 2, end: start + 2 + name.length });
-        token(state, 'syntax', { start: start + 2 + name.length, end: start + 3 + name.length });
-        let regexEnd = end - 1;
-        const flag = inner.match(/:([gimsuy]+)$/);
-        if (flag && inner.length > flag[0].length) {
-            const flagStart = end - 1 - flag[1].length;
-            token(state, 'syntax', { start: flagStart - 1, end: flagStart });
-            token(state, 'regexFlag', { start: flagStart, end: end - 1 });
-            regexEnd = flagStart - 1;
-        }
-        token(state, 'regex', { start: start + 3 + name.length, end: regexEnd });
-        token(state, 'syntax', { start: end - 1, end });
-        state.regions.push({ start, end, kind: 'argument' });
     }
-    return deepFreeze({ source, tokens: state.tokens.sort((a, b) => a.start - b.start), diagnostics: state.diagnostics, references: [], regions: state.regions });
+    state.diagnostics.sort((a, b) => a.range.start - b.range.start || (a.severity === b.severity ? 0 : a.severity === 'error' ? -1 : 1));
+    return deepFreeze({ source, template, variableTypes: inferred.variableTypes, callSignatures, tokens: state.tokens, diagnostics: state.diagnostics, references: state.references, regions: state.regions });
 }

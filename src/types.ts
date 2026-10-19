@@ -1,3 +1,4 @@
+import type { FunctionParameter, ParameterTypes, OverloadArgument } from './functions.js';
 import type { SnippetFragment } from './fragment.js';
 import type { SnippetTemplate } from './analyzer.js';
 export interface ExecutionCheck {
@@ -7,7 +8,7 @@ export interface SourceRange {
     readonly start: number;
     readonly end: number;
 }
-export type TokenKind = 'syntax' | 'keyword' | 'variable' | 'function' | 'randomFunction' | 'typeFunction' | 'snippetFunction' | 'operator' | 'list' | 'fragmentDelimiter' | 'cursorSyntax' | 'cursor' | 'regex' | 'regexFlag' | 'bool' | 'null';
+export type TokenKind = 'syntax' | 'parenthesis' | 'keyword' | 'variable' | 'function' | 'randomFunction' | 'typeFunction' | 'snippetFunction' | 'operator' | 'arithmeticOperator' | 'rangeOperator' | 'list' | 'fragmentDelimiter' | 'cursorSyntax' | 'cursor' | 'regex' | 'regexFlag' | 'bool' | 'null' | 'stringEscape';
 export interface HighlightToken extends SourceRange {
     readonly kind: TokenKind;
 }
@@ -39,17 +40,65 @@ export interface RangeValue {
 }
 export type Value = string | number | boolean | null | undefined | SnippetFragment | RangeValue | readonly Value[];
 export type Variables = Record<string | symbol, Value>;
+export type ValueType = 'string' | 'number' | 'bool' | 'fragment' | 'list' | 'range' | 'null' | 'undefined' | 'unknown';
+export interface VariableTypeInfo {
+    readonly name: string;
+    readonly range: SourceRange;
+    readonly types: readonly ValueType[];
+    readonly elementTypes?: readonly ValueType[];
+}
+export interface CallTypeInfo {
+    readonly argumentTypes?: readonly OverloadArgument[];
+    readonly range: SourceRange;
+    readonly types: readonly ValueType[];
+    readonly elementTypes?: readonly ValueType[];
+}
+export interface CallableOverload {
+    readonly id: string;
+    readonly parameters: readonly (FunctionParameter & { readonly optional?: boolean; readonly rest?: boolean })[];
+    readonly returnTypes: ParameterTypes;
+    readonly returnElementTypes?: readonly ValueType[];
+}
+export interface CallSignature {
+    readonly kind: 'function' | 'snippet';
+    readonly overloads: readonly CallableOverload[];
+    readonly callRange: SourceRange;
+    readonly complete: boolean;
+    readonly argumentStarts: readonly number[];
+    readonly matches: boolean;
+    readonly name: string;
+    readonly range: SourceRange;
+}
 export interface Analysis {
     readonly source: string;
     readonly template: SnippetTemplate;
+    readonly variableTypes: readonly VariableTypeInfo[];
+    readonly callSignatures: readonly CallSignature[];
     readonly tokens: readonly HighlightToken[];
     readonly diagnostics: readonly Diagnostic[];
     readonly references: readonly SnippetReference[];
     readonly regions: readonly Region[];
 }
+export interface TriggerParameter {
+    readonly name: string;
+    readonly regex: string;
+    readonly flags: string;
+    readonly range: SourceRange;
+    readonly nameRange: SourceRange;
+    readonly regexRange?: SourceRange;
+    readonly flagsRange?: SourceRange;
+}
+export interface TriggerAnalysis extends Omit<Analysis, 'template' | 'variableTypes' | 'callSignatures'> {
+    readonly kind: 'literal' | 'regex' | 'invalid';
+    readonly literal?: string;
+    readonly pattern?: string;
+    readonly flags: string;
+    readonly parameters: readonly TriggerParameter[];
+}
 export interface AnalyzeOptions {
     library?: readonly Snippet[] | null;
     variables?: readonly string[];
+    variableTypes?: Readonly<Record<string, readonly ValueType[]>>;
     forDepth?: number;
     checkVariables?: boolean;
 }
@@ -128,6 +177,7 @@ export type Expr = Readonly<({
     readonly range: SourceRange;
 };
 export interface Assignment {
+    readonly range: SourceRange;
     readonly name: string;
     readonly operator?: string;
     readonly expression?: Expr;

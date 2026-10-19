@@ -7,3 +7,6 @@ export * from './scanner.js';
 export * from './functions.js';
 export * from './values.js';
 export * from './environment.js';
+export * from './trigger.js';
+export * from './inference.js';
+export { valueTypeOf } from './value-type.js';

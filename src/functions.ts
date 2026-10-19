@@ -226,6 +226,12 @@ export const FUNCTIONS = defineFunctions({
         ],
         execute: () => '\u0008',
     },
+    newline: {
+        overloads: [
+            overload([], ['string']),
+        ],
+        execute: () => '\n',
+    },
     paste: {
         overloads: [
             overload([], ['string']),

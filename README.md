@@ -45,6 +45,8 @@ The same `Analysis` is accepted by `execute()` and can be rendered by any host h
 
 Compact blocks may nest and wrap conditionals or loops. They add no variable scope: declarations and assignments behave as if the compact markers were absent. The analyzer applies formatting to literal text nodes and retains original UTF-16 token and diagnostic ranges; execution does not trim generated output. A fragment literal or called snippet applies compact formatting only if its own source contains a compact block.
 
+`newline()` takes no arguments and returns a string containing one LF (`\n`). Use `{{newline()}}` to insert a line break, including within compact blocks, or store its result and compose it in expressions.
+
 ## Variable type inference
 
 `analyze()` also returns `variableTypes`: `{ name, range, types, elementTypes? }` entries for variable reads, assignment targets, and loop `index`/`value` expressions. Ranges use the original source, including inside backtick fragments. `types` contains language names (`string`, `number`, `bool`, `fragment`, `list`, `range`, `null`, `undefined`) or `unknown` when a type cannot be determined. Optional `elementTypes` describes possible list element types, merged across repeated analysis of the same occurrence. Hosts can display `list<string | number>` without changing the underlying `list` value type. Assignment targets show the assigned type; later reads reflect the assignments that can reach that position. Assignments remain dynamically typed. The same inference pass checks function arguments and cursor expressions and adds type diagnostics to `Analysis.diagnostics`.

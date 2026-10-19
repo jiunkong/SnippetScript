@@ -369,6 +369,7 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
     const stack: Frame[] = [root];
     const body = (frame: Frame) => new SnippetTemplate(state.source, frame.nodes);
     let position = 0;
+    let compactDepth = 0;
     while (position < text.length) {
         let start = text.indexOf('{{', position);
         while (start !== -1 && text[start + 2] === '{')
@@ -378,7 +379,12 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
         let frame = stack.at(-1)!;
         if (start > position) {
             const range = rangeOf(map, position, start);
-            frame.nodes.push({ type: 'text', value: text.slice(position, start), range, offset: range.start });
+            const literal = text.slice(position, start);
+            // Compact applies only to literal source text. Expressions, quoted
+            // strings and called snippets retain the whitespace they produce.
+            const value = compactDepth > 0
+                ? literal.replace(/(?:\r\n|\r|\n)[\t ]*/g, '') : literal;
+            frame.nodes.push({ type: 'text', value, range, offset: range.start });
         }
         if (start === text.length)
             break;
@@ -417,7 +423,7 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
             const node = (value: any) => frame.nodes.push({ ...value, range, offset: range.start });
             if (!tag)
                 fail('err_unknown_tag', range, ['']);
-            const keyword = tag.match(/^(if|elif|else|endif|for|endfor|set|switch|endswitch|case|endcase|default|enddefault|break|continue)\b/);
+            const keyword = tag.match(/^(if|elif|else|endif|for|endfor|set|switch|endswitch|case|endcase|default|enddefault|break|continue|compact|endcompact)\b/);
             if (keyword) {
                 syntax();
                 token(state, 'keyword', rangeOf(map, tagStart, tagStart + keyword[0].length));
@@ -428,7 +434,14 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
                 // Include leading, keyword-separating and trailing whitespace
                 // so hosts can draw a continuous tag background and underline.
                 state.regions.push({ ...rangeOf(map, start + 2, end), kind: 'expression' });
-                if (['if', 'for', 'switch', 'case'].includes(type)) {
+                if (type === 'compact') {
+                    if (from < tagEnd)
+                        fail('err_template_syntax', range, [tag]);
+                    // A formatting block adds no variable or runtime scope.
+                    stack.push({ type, nodes: [], scope: frame.scope, range });
+                    compactDepth++;
+                }
+                else if (['if', 'for', 'switch', 'case'].includes(type)) {
                     if (type === 'case' && frame.type !== 'switch')
                         fail('err_template_syntax', range, [tag]);
                     if (from >= tagEnd)
@@ -471,12 +484,18 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
                     stack.push({ type, nodes: [], scope: cloneScope(frame.scope), range });
                 }
                 else if (type.startsWith('end')) {
+                    if (type === 'endcompact' && from < tagEnd)
+                        fail('err_template_syntax', range, [tag]);
                     if (frame.type !== type.slice(3))
-                        fail(({ endif: 'err_endif_no_if', endfor: 'err_endfor_no_for', endswitch: 'err_endswitch_no_switch', endcase: 'err_endcase_no_case', enddefault: 'err_enddefault_no_default' } as Record<string, string>)[type] || 'err_template_syntax', range);
+                        fail(({ endif: 'err_endif_no_if', endfor: 'err_endfor_no_for', endswitch: 'err_endswitch_no_switch', endcase: 'err_endcase_no_case', enddefault: 'err_enddefault_no_default', endcompact: 'err_endcompact_no_compact' } as Record<string, string>)[type] || 'err_template_syntax', range);
                     stack.pop();
                     const parent = stack.at(-1)!;
                     const common = { range: frame.range, offset: frame.range.start };
-                    if (frame.type === 'if') {
+                    if (frame.type === 'compact') {
+                        parent.nodes.push(...frame.nodes);
+                        compactDepth--;
+                    }
+                    else if (frame.type === 'if') {
                         frame.branches!.push({ expression: frame.expression ?? null, body: body(frame), range: frame.range });
                         parent.nodes.push({ ...common, range: frame.branches![0].range, offset: frame.branches![0].range.start, type: 'if', branches: frame.branches! });
                     }
@@ -559,7 +578,7 @@ function parseBody(raw: string, inputMap: readonly number[], state: State, initi
         }
     }
     for (const frame of stack.slice(1))
-        report(state, createSnippetError(({ if: 'err_if_unclosed', for: 'err_for_unclosed', switch: 'err_switch_unclosed', case: 'err_case_unclosed', default: 'err_default_unclosed' } as Record<string, string>)[frame.type]), frame.range);
+        report(state, createSnippetError(({ if: 'err_if_unclosed', for: 'err_for_unclosed', switch: 'err_switch_unclosed', case: 'err_case_unclosed', default: 'err_default_unclosed', compact: 'err_compact_unclosed' } as Record<string, string>)[frame.type]), frame.range);
     return body(root);
 }
 function deepFreeze<T>(value: T): T {

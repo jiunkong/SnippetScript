@@ -39,6 +39,12 @@ A library is an array of `{ id?, name?, trigger?, replacement?, disabled? }` def
 
 The same `Analysis` is accepted by `execute()` and can be rendered by any host highlighter. Execution never parses raw expression strings. Dynamic `fragment(string)` explicitly analyzes new source; ordinary strings and evaluated results are never reinterpreted as code.
 
+## Compact formatting
+
+`{{compact}} … {{endcompact}}` removes literal source line breaks (LF, CRLF or CR) and the spaces/tabs immediately after them. It preserves ordinary text, inline whitespace, and whitespace outside the block. Newlines produced by expressions, strings, fragment literals and snippet calls remain intact; use `{{"\n"}}` to insert one explicitly.
+
+Compact blocks may nest and wrap conditionals or loops. They add no variable scope: declarations and assignments behave as if the compact markers were absent. The analyzer applies formatting to literal text nodes and retains original UTF-16 token and diagnostic ranges; execution does not trim generated output. A fragment literal or called snippet applies compact formatting only if its own source contains a compact block.
+
 ## Variable type inference
 
 `analyze()` also returns `variableTypes`: `{ name, range, types, elementTypes? }` entries for variable reads, assignment targets, and loop `index`/`value` expressions. Ranges use the original source, including inside backtick fragments. `types` contains language names (`string`, `number`, `bool`, `fragment`, `list`, `range`, `null`, `undefined`) or `unknown` when a type cannot be determined. Optional `elementTypes` describes possible list element types, merged across repeated analysis of the same occurrence. Hosts can display `list<string | number>` without changing the underlying `list` value type. Assignment targets show the assigned type; later reads reflect the assignments that can reach that position. Assignments remain dynamically typed. The same inference pass checks function arguments and cursor expressions and adds type diagnostics to `Analysis.diagnostics`.

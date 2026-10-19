@@ -1,0 +1,172 @@
+import type { SnippetFragment } from './fragment.js';
+import type { SnippetTemplate } from './analyzer.js';
+export interface ExecutionCheck {
+    check(): void;
+}
+export interface SourceRange {
+    readonly start: number;
+    readonly end: number;
+}
+export type TokenKind = 'syntax' | 'keyword' | 'variable' | 'function' | 'randomFunction' | 'typeFunction' | 'snippetFunction' | 'operator' | 'list' | 'fragmentDelimiter' | 'cursorSyntax' | 'cursor' | 'regex' | 'regexFlag' | 'bool' | 'null';
+export interface HighlightToken extends SourceRange {
+    readonly kind: TokenKind;
+}
+export interface Diagnostic {
+    readonly code: string;
+    readonly args: readonly unknown[];
+    readonly severity: 'error' | 'warning';
+    readonly range: SourceRange;
+}
+export interface Region extends SourceRange {
+    readonly kind: 'expression' | 'cursorExpression' | 'cursor' | 'argument';
+}
+export interface SnippetReference extends SourceRange {
+    readonly name: string;
+    readonly targetId?: string;
+    readonly targetIndex?: number;
+}
+export interface Snippet {
+    id?: string;
+    name?: string;
+    trigger?: string;
+    replacement?: string;
+    disabled?: boolean;
+}
+export interface RangeValue {
+    readonly type: 'range';
+    readonly start: number;
+    readonly end: number;
+}
+export type Value = string | number | boolean | null | undefined | SnippetFragment | RangeValue | readonly Value[];
+export type Variables = Record<string | symbol, Value>;
+export interface Analysis {
+    readonly source: string;
+    readonly template: SnippetTemplate;
+    readonly tokens: readonly HighlightToken[];
+    readonly diagnostics: readonly Diagnostic[];
+    readonly references: readonly SnippetReference[];
+    readonly regions: readonly Region[];
+}
+export interface AnalyzeOptions {
+    library?: readonly Snippet[] | null;
+    variables?: readonly string[];
+    forDepth?: number;
+    checkVariables?: boolean;
+}
+export interface HostRequest {
+    readonly name: string;
+    readonly args: readonly Value[];
+    readonly sourceRange: SourceRange;
+}
+export interface Host {
+    invoke(request: HostRequest, context: {
+        signal: AbortSignal;
+    }): Value | Promise<Value>;
+}
+export interface Environment {
+    now(): number;
+    date(): Date;
+    random(): number;
+    uuid(): string;
+    yield(): Promise<void>;
+}
+export interface Limits {
+    timeoutMs?: number;
+    maxCallDepth?: number;
+}
+export interface ExecuteOptions {
+    variables?: Variables;
+    library?: readonly Snippet[];
+    host?: Host;
+    signal?: AbortSignal;
+    limits?: Limits;
+    environment?: Partial<Environment>;
+}
+export type Expr = Readonly<({
+    kind: 'literal';
+    value: Value;
+} | {
+    kind: 'variable';
+    name: string;
+} | {
+    kind: 'loop';
+    name: 'index' | 'value';
+} | {
+    kind: 'list';
+    items: readonly Expr[];
+} | {
+    kind: 'index';
+    target: Expr;
+    index: Expr;
+} | {
+    kind: 'unary';
+    operator: string;
+    operand: Expr;
+} | {
+    kind: 'binary';
+    operator: string;
+    left: Expr;
+    right: Expr;
+} | {
+    kind: 'conditional';
+    condition: Expr;
+    yes: Expr;
+    no: Expr;
+} | {
+    kind: 'call';
+    name: string;
+    args: readonly Expr[];
+} | {
+    kind: 'snippet';
+    name: string;
+    args: readonly Expr[];
+    offset?: Expr;
+} | {
+    kind: 'fragment';
+    template: SnippetTemplate;
+})> & {
+    readonly range: SourceRange;
+};
+export interface Assignment {
+    readonly name: string;
+    readonly operator?: string;
+    readonly expression?: Expr;
+}
+export type TemplateNode = Readonly<({
+    type: 'text';
+    value: string;
+} | {
+    type: 'cursor';
+    level: number;
+} | {
+    type: 'expression' | 'cursorExpression';
+    expression: Expr;
+} | {
+    type: 'set';
+    assignments: readonly Assignment[];
+} | {
+    type: 'break' | 'continue';
+} | {
+    type: 'for';
+    expression: Expr;
+    body: SnippetTemplate;
+} | {
+    type: 'if';
+    branches: readonly {
+        expression: Expr | null;
+        body: SnippetTemplate;
+        range: SourceRange;
+    }[];
+} | {
+    type: 'switch';
+    expression: Expr;
+    cases: readonly {
+        expressions: readonly Expr[];
+        body: SnippetTemplate;
+        range: SourceRange;
+    }[];
+    defaultBody?: SnippetTemplate;
+})> & {
+    readonly range: SourceRange;
+    readonly offset: number;
+};

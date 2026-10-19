@@ -76,3 +76,25 @@ for (const [source, code, marker] of [
         await assert.rejects(execute(analysis));
     });
 }
+
+test('compact text regions cover original literal source without nested layers or tag contents', () => {
+    const source = 'outside{{compact}}\\\r\n  A{{if true}}\n  B{{endif}}{{compact}}\n C{{endcompact}}\n{{endcompact}}outside';
+    const analysis = analyze(source);
+    assert.deepEqual(analysis.diagnostics, []);
+    const regions = analysis.regions.filter(region => region.kind === 'compactText');
+    assert.deepEqual(regions.map(region => source.slice(region.start, region.end)), ['\\\r\n  A', '\n  B', '\n C', '\n']);
+    for (let i = 1; i < regions.length; i++) assert.ok(regions[i - 1].end <= regions[i].start);
+    assert.ok(regions.every(region => Object.isFrozen(region)));
+});
+
+test('unfinished compact text retains source coverage even if continuation normalization removes it all', () => {
+    const source = '{{compact}}\\\n  ';
+    const analysis = analyze(source);
+    assert.deepEqual(analysis.regions.filter(region => region.kind === 'compactText'), [
+        { start: '{{compact}}'.length, end: source.length, kind: 'compactText' }
+    ]);
+    assert.ok(analysis.diagnostics.some(diagnostic => diagnostic.code === 'err_compact_unclosed'));
+    // An unfinished tag owns the remaining source, including continuations.
+    const unfinishedTag = analyze('{{compact}}{{"unfinished\\\n  ');
+    assert.deepEqual(unfinishedTag.regions.filter(region => region.kind === 'compactText'), []);
+});

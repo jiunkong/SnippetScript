@@ -1,6 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import * as context from '../dist/index.js';
+import * as core from '../dist/index.js';
+// Language values are boxed; these existing behavior assertions inspect payloads.
+const context = { ...core, evaluateExpression: (...args) => core.toNative(core.evaluateExpression(...args)) };
 
 test('multiplication repeats strings in either order and preserves numeric multiplication', () => {
   for (const [expression, expected] of [

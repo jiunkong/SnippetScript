@@ -1,4 +1,5 @@
-import type { ExecutionCheck, Value } from './types.js';
+import type { ExecutionCheck } from './types.js';
+import { ScriptValue, Types } from './type-system.js';
 import { createSnippetError } from './errors.js';
 export type FragmentNode = {
     readonly type: 'text';
@@ -9,9 +10,13 @@ export type FragmentNode = {
 };
 // Evaluated output. Text is always data; only cursor nodes become tab stops.
 // Converting to a string is deliberately lossy: cursor syntax becomes text.
-export class SnippetFragment {
+export class SnippetFragment extends ScriptValue<readonly FragmentNode[]> {
+    readonly kind = 'fragment';
+    readonly descriptor = Types.fragment;
+    get value() { return this.nodes; }
     readonly nodes: readonly FragmentNode[];
     constructor(nodes: readonly FragmentNode[] = []) {
+        super();
         const normalized: any[] = [];
         for (const node of nodes) {
             if (node.type === 'text') {
@@ -36,7 +41,7 @@ export class SnippetFragment {
     }
     static from(value: unknown) {
         return value instanceof SnippetFragment ? value
-            : new SnippetFragment([{ type: 'text', value: String(value ?? '') }]);
+            : new SnippetFragment([{ type: 'text', value: value instanceof ScriptValue ? value.toString() : String(value ?? '') }]);
     }
     toString() {
         return this.nodes.map(node => node.type === 'text' ? node.value : `{{#${node.level}}}`).join('');
@@ -102,7 +107,7 @@ export class SnippetFragment {
         return this.nodes.map(node => node.type === 'text' ? text(node.value) : cursor(node.level)).join('');
     }
 }
-export function snippetIterableItems(value: string | readonly Value[] | SnippetFragment, execution?: ExecutionCheck): any[] {
+export function snippetIterableItems(value: string | readonly unknown[] | SnippetFragment, execution?: ExecutionCheck): any[] {
     return Array.from(value instanceof SnippetFragment ? value.iterate(execution) : value);
 }
 export function snippetFragmentFromUnits(units: readonly unknown[]) {

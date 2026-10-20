@@ -1,22 +1,45 @@
+import { Type, Types, ListType, NumberValue, UnionType, typeFromNames, typeInfo } from './type-system.js';
 import { FUNCTIONS, SNIPPET_PARAMETER_TYPES, argumentTypeLabel, resolveFunctionOverloads } from './functions.js';
 import type { AnalyzeOptions, CallTypeInfo, Diagnostic, Expr, SourceRange, ValueType, VariableTypeInfo } from './types.js';
 import type { SnippetTemplate } from './analyzer.js';
-import { binaryValue } from './value-operations.js';
+import { binaryValue } from './native-values.js';
 
 // This pass only reads the shared AST. It never evaluates user code or host calls.
-interface Info { types: ValueType[]; elements?: ValueType[]; exactElements?: boolean }
+type Info = ReturnType<typeof typeInfo>;
 type Scope = Map<string, Info>;
 interface Flow { normal?: Scope; breaks: Scope[]; continues: Scope[] }
 const order: ValueType[] = ['string', 'number', 'bool', 'fragment', 'list', 'range', 'null', 'undefined', 'unknown'];
 const names = (values: readonly ValueType[]): ValueType[] => values.includes('unknown') ? ['unknown'] : order.filter(type => values.includes(type));
-const info = (...types: ValueType[]): Info => ({ types: names(types) });
-const unknown = () => info('unknown');
-const union = (...values: Info[]): Info => ({ exactElements: values.every(value => value.exactElements) && values.every(value => JSON.stringify(value.elements) === JSON.stringify(values[0]?.elements)), types: names(values.flatMap(value => value.types)),
-    elements: values.some(value => value.types.includes('list')) ? names(values.filter(value => value.types.includes('list')).flatMap(value => value.elements ?? ['unknown'])) : undefined });
+const info = (...types: ValueType[]): Info => typeInfo(typeFromNames(types));
+const unknown = () => typeInfo(Types.unknown);
+// Recursive assignments such as $x=[$x] must reach a conservative fixed point.
+// Values keep their full structure; only flow analysis widens deep shapes.
+const MAX_FLOW_TYPE_DEPTH = 6;
+function widen(type: Type, depth = 0, seen = new WeakMap<Type, Map<number, Type>>()): Type {
+    if (!(type instanceof ListType) && !(type instanceof UnionType)) return type;
+    const cached = seen.get(type)?.get(depth);
+    if (cached) return cached;
+    const result = type instanceof ListType ? new ListType(depth >= MAX_FLOW_TYPE_DEPTH ? Types.unknown : widen(type.element, depth + 1, seen))
+        : UnionType.of(...type.members.map(member => widen(member, depth, seen)));
+    if (!seen.has(type)) seen.set(type, new Map());
+    seen.get(type)!.set(depth, result);
+    return result;
+}
+const union = (...values: Info[]): Info => typeInfo(widen(UnionType.of(...values.map(value => value.type))),
+    values.every(value => value.exactElements) && values.every(value => value.type.equals(values[0].type)));
 function merge(scopes: Scope[]): Scope | undefined {
     if (!scopes.length) return undefined;
     return new Map([...new Set(scopes.flatMap(scope => [...scope.keys()]))].map(name =>
         [name, union(...scopes.map(scope => scope.get(name) ?? info('undefined')))]));
+}
+function itemType(type: Type): Type {
+    if (type instanceof UnionType) return UnionType.of(...type.members.map(itemType));
+    if (type instanceof ListType) return type.element;
+    return type.kind === 'string' || type.kind === 'fragment' ? type : type.kind === 'unknown' ? Types.unknown : Types.number;
+}
+function listElements(type: Type): Type {
+    if (type instanceof ListType) return type.element;
+    return type instanceof UnionType ? UnionType.of(...type.members.filter(member => member instanceof ListType).map(member => (member as ListType).element)) : Types.unknown;
 }
 function binary(operator: string, left: Info, right: Info): Info {
     if (['==', '!=', '<', '>', '<=', '>=', '&&', '||'].includes(operator)) return info('bool');
@@ -27,7 +50,7 @@ function binary(operator: string, left: Info, right: Info): Info {
     for (const a of left.types) for (const b of right.types) {
         if (operator === '+') {
             if (a === 'list' || b === 'list') {
-                if (a === b) results.push({ types: ['list'], elements: names([...(left.elements ?? ['unknown']), ...(right.elements ?? ['unknown'])]) });
+                if (a === b) results.push(typeInfo(new ListType(UnionType.of(...[left, right].map(value => listElements(value.type))))));
             } else results.push(info(a === 'fragment' || b === 'fragment' ? 'fragment' : a === 'string' || b === 'string' ? 'string' : 'number'));
         } else if (operator === '-' && (a === 'list' || b === 'list')) {
             if (a === b) results.push(left);
@@ -42,11 +65,9 @@ function builtin(name: string, args: Info[]): Info {
     const candidates = resolution.candidates.length ? resolution.candidates : resolution.fallback;
     if (!candidates.length) return unknown();
     const inferred = FUNCTIONS[name]?.inferReturn?.(args, candidates);
-    if (inferred) return { ...inferred, types: names(inferred.types), elements: inferred.elements && names(inferred.elements) };
+    if (inferred) return typeInfo(inferred.type ?? typeFromNames(inferred.types, inferred.elements), inferred.exactElements);
     return union(...candidates.map(overload => {
-        const result: Info = overload.returnTypes === 'any' ? unknown() : info(...overload.returnTypes);
-        if (result.types.includes('list')) result.elements = [...(overload.returnElementTypes ?? ['unknown'])];
-        return result;
+        return typeInfo(overload.returnType.kind === 'any' ? Types.unknown : overload.returnType);
     }));
 }
 
@@ -60,7 +81,7 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
     function numericConstant(node: Expr): number | undefined {
         if (numericConstants.has(node)) return numericConstants.get(node);
         let value: number | undefined;
-        if (node.kind === 'literal' && typeof node.value === 'number') value = node.value;
+        if (node.kind === 'literal' && node.value instanceof NumberValue) value = node.value.value;
         else if (node.kind === 'unary') {
             const operand = numericConstant(node.operand);
             if (operand !== undefined) value = node.operator === '-' ? -operand : operand;
@@ -105,16 +126,13 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
     function record(name: string, range: SourceRange, value: Info) {
         const key = `${range.start}:${range.end}`;
         const previous = occurrences.get(key);
-        const types = names([...(previous?.types ?? []), ...value.types]);
-        const elementTypes = types.includes('list') ? names([
-            ...(previous?.types.includes('list') ? previous.elementTypes ?? ['unknown'] : []),
-            ...(value.types.includes('list') ? value.elements ?? ['unknown'] : [])
-        ]) : undefined;
-        occurrences.set(key, { name, range, types, elementTypes });
+        const type = previous ? previous.type.union(value.type) : value.type;
+        const view = typeInfo(type);
+        occurrences.set(key, { name, range, type, types: view.types, elementTypes: view.elements });
     }
     function expression(node: Expr, scope: Scope, loopValue?: Info): Info {
         switch (node.kind) {
-            case 'literal': return info(node.value === null ? 'null' : node.value === undefined ? 'undefined' : typeof node.value === 'boolean' ? 'bool' : typeof node.value === 'number' ? 'number' : 'string');
+            case 'literal': return typeInfo(node.value.descriptor);
             case 'variable': {
                 const value = scope.get(node.name) ?? unknown(); record(node.name, node.range, value); return value;
             }
@@ -130,11 +148,11 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
                 return recordCall(node.range, info('fragment'));
             case 'list': {
                 const items = node.items.map(item => expression(item, scope, loopValue));
-                return { types: ['list'], elements: names(items.flatMap(item => item.types)), exactElements: items.every(item => item.types.length === 1 && !item.types.includes('unknown')) };
+                return typeInfo(new ListType(UnionType.of(...items.map(item => item.type))), items.every(item => item.type.kind !== 'union' && item.type.kind !== 'unknown'));
             }
             case 'index': {
                 const target = expression(node.target, scope, loopValue); expression(node.index, scope, loopValue);
-                return info(...target.types.flatMap<ValueType>(type => type === 'list' ? target.elements ?? ['unknown'] : type === 'range' ? ['number'] as ValueType[] : type === 'string' || type === 'fragment' ? [type] : ['unknown']), 'undefined');
+                return typeInfo(UnionType.of(itemType(target.type), Types.undefined));
             }
             case 'unary': expression(node.operand, scope, loopValue); return info('number');
             case 'binary':
@@ -198,7 +216,7 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
                 }
                 case 'for': {
                     const iterable = expression(node.expression, scope, loopValue);
-                    const item = info(...iterable.types.flatMap(type => type === 'list' ? iterable.elements ?? ['unknown'] : type === 'string' || type === 'fragment' ? [type] : type === 'unknown' ? ['unknown'] : ['number']) as ValueType[]);
+                    const item = typeInfo(itemType(iterable.type));
                     const entry = new Map(scope); entry.set('index', info('number'));
                     let head = entry;
                     const exits: Scope[] = [scope]; // The loop may execute zero times.
@@ -210,7 +228,7 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
                         const back = [...flow.continues, ...(flow.normal ? [flow.normal] : [])];
                         exits.push(...back);
                         const next = merge([entry, ...back])!;
-                        if (JSON.stringify([...next]) === JSON.stringify([...head])) break;
+                        if ([...next].every(([name,value]) => head.get(name)?.type.equals(value.type))) break;
                         head = next;
                     }
                     const merged = merge(exits)!;
@@ -225,7 +243,7 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
         return { normal: scope ? clean(scope) : undefined, breaks: breaks.map(clean), continues: continues.map(clean) };
     }
     const scope: Scope = new Map((options.variables ?? []).map(name => [name, info('string')]));
-    for (const [name, types] of Object.entries(options.variableTypes ?? {})) scope.set(name, info(...types));
+    for (const [name, types] of Object.entries(options.variableTypes ?? {})) scope.set(name, types instanceof Type ? typeInfo(types) : info(...types));
     block(template, scope);
     const diagnostics: Diagnostic[] = [...zeroDivisors.values()];
     for (const entry of checks.values()) {
@@ -247,7 +265,7 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
     }
     const variableTypes = Object.freeze([...occurrences.values()].sort((a, b) => a.range.start - b.range.start || a.range.end - b.range.end)
         .map(value => Object.freeze({ ...value, types: Object.freeze(value.types), elementTypes: value.elementTypes && Object.freeze(value.elementTypes), range: Object.freeze(value.range) })));
-    const callTypes = Object.freeze([...calls.values()].map(call => Object.freeze({ range: Object.freeze(call.range), types: Object.freeze(call.value.types),
+    const callTypes = Object.freeze([...calls.values()].map(call => Object.freeze({ range: Object.freeze(call.range), type: call.value.type, types: Object.freeze(call.value.types),
         elementTypes: call.value.elements && Object.freeze(call.value.elements),
         argumentTypes: call.args?.map(arg => Object.freeze({ ...arg, types: Object.freeze(arg.types), elements: arg.elements ? Object.freeze(arg.elements) : undefined })) })));
     return Object.freeze({ variableTypes, callTypes, diagnostics: Object.freeze(diagnostics) });

@@ -10,3 +10,6 @@ export * from './environment.js';
 export * from './trigger.js';
 export * from './inference.js';
 export { valueTypeOf } from './value-type.js';
+
+export * from './type-system.js';
+export * from './value-codec.js';

@@ -23,7 +23,7 @@ test('copy normalizes successful host responses to undefined and inserts no text
   } } });
   assert.equal(String(result), 'Aundefined//undefinedB');
   assert.equal(calls.length, 2);
-  assert.equal(calls[0].args[0], 'text');
+  assert.equal(calls[0].args[0].value, 'text');
   assert.ok(calls[1].args[0] instanceof SnippetFragment);
   assert.equal(calls[1].args[0].toString(), 'a{{#1}}');
 });

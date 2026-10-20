@@ -1,3 +1,5 @@
+import { fromNative, toNative } from './value-codec.js';
+import { NumberValue, StringValue, Types } from './type-system.js';
 import { inferTemplateTypes } from './inference.js';
 import { snippetParameterNames } from './trigger.js';
 export { analyzeTrigger } from './trigger.js';
@@ -110,9 +112,9 @@ class ExpressionParser {
                 const index = this.parse();
                 const close = this.expected(']', 'err_list_index_integer', this.range(next.start, this.text.length));
                 this.mark(close, 'list');
-                if (left.kind === 'literal' && typeof left.value !== 'string')
+                if (left.kind === 'literal' && !(left.value instanceof StringValue))
                     report(this.state, createSnippetError('err_list_index_target'), left.range);
-                if (index.kind === 'literal' && (typeof index.value !== 'number' || !Number.isSafeInteger(index.value)))
+                if (index.kind === 'literal' && (!(index.value instanceof NumberValue) || !Number.isSafeInteger(index.value.value)))
                     report(this.state, createSnippetError('err_list_index_integer'), index.range);
                 left = { kind: 'index', target: left, index, range: { start: left.range.start, end: this.range(close.start, close.end).end } };
                 continue;
@@ -161,13 +163,13 @@ class ExpressionParser {
     atom(): Expr {
         const item = this.advance(), range = this.range(item.start, item.end);
         if (item.type === 'number')
-            return { kind: 'literal', value: /^0[xXbBoO]/.test(item.text) ? parseFloat(item.text) : Number(item.text), range };
+            return { kind: 'literal', value: fromNative(/^0[xXbBoO]/.test(item.text) ? parseFloat(item.text) : Number(item.text)), range };
         if (item.type === 'string') {
-            if (item.data?.incomplete) return { kind: 'literal', value: '', range };
+            if (item.data?.incomplete) return { kind: 'literal', value: fromNative(''), range };
             const escapes = scanSnippetStringEscapes(item.text);
             for (const escape of escapes)
                 token(this.state, 'stringEscape', this.range(item.start + escape.start, item.start + escape.end));
-            return { kind: 'literal', value: decodeSnippetStringLiteral(item.text, escapes), range };
+            return { kind: 'literal', value: fromNative(decodeSnippetStringLiteral(item.text, escapes)), range };
         }
         if (item.type === 'variable') {
             this.mark(item, 'variable');
@@ -295,7 +297,7 @@ class ExpressionParser {
             }
             if (['true', 'false', 'null', 'undefined'].includes(item.text)) {
                 this.mark(item, item.text === 'null' || item.text === 'undefined' ? 'null' : 'bool');
-                return { kind: 'literal', value: item.text === 'true' ? true : item.text === 'false' ? false : item.text === 'null' ? null : undefined, range };
+                return { kind: 'literal', value: fromNative(item.text === 'true' ? true : item.text === 'false' ? false : item.text === 'null' ? null : undefined), range };
             }
             fail('err_unknown_tag', range, [item.text]);
         }
@@ -611,7 +613,7 @@ export function analyze(source: string, options: AnalyzeOptions = {}): Analysis 
             const overloads = candidates.map(overload => ({ id: overload.id,
                 parameters: [...overload.parameters.map((parameter, index) => ({ ...parameter, optional: index >= overload.min })),
                     ...(overload.restParameter ? [{ ...overload.restParameter, rest: true }] : [])],
-                returnTypes: overload.returnTypes === 'any' && inferredCall && !inferredCall.types.includes('unknown') ? inferredCall.types : overload.returnTypes,
+                returnType: overload.returnType.kind === 'any' ? inferredCall?.type ?? Types.unknown : spec.inferReturn?.(inferredCall?.argumentTypes ?? [], [overload]).type ?? overload.returnType, returnTypes: overload.returnTypes === 'any' && inferredCall && !inferredCall.types.includes('unknown') ? inferredCall.types : overload.returnTypes,
                 returnElementTypes: overload.returnElementTypes ?? (overload.returnTypes === 'any' || overload.returnTypes.includes('list')
                     ? spec.inferReturn?.(inferredCall?.argumentTypes ?? [], [overload]).elements ?? inferredCall?.elementTypes : undefined) }));
             callSignatures.push({ ...call, callRange: call.callRange ?? call.range, complete: call.complete ?? true, argumentStarts: call.argumentStarts ?? [], matches: !!resolution.candidates.length,
@@ -619,9 +621,9 @@ export function analyze(source: string, options: AnalyzeOptions = {}): Analysis 
         } else {
             const targets = options.library?.filter(snippet => snippet.name === call.name);
             if (targets?.length !== 1) continue;
-            const parameters = snippetParameterNames(targets[0].trigger).map(name => ({ name, types: SNIPPET_PARAMETER_TYPES }));
+            const parameters = snippetParameterNames(targets[0].trigger).map(name => ({ name, type: Types.string, types: SNIPPET_PARAMETER_TYPES }));
             callSignatures.push({ ...call, callRange: call.callRange ?? call.range, complete: call.complete ?? true, argumentStarts: call.argumentStarts ?? [], matches: true,
-                overloads: [{ id: 'snippet:' + call.name, parameters, returnTypes: ['fragment'] }] });
+                overloads: [{ id: 'snippet:' + call.name, parameters, returnType: Types.fragment, returnTypes: ['fragment'] }] });
         }
     }
     state.diagnostics.sort((a, b) => a.range.start - b.range.start || (a.severity === b.severity ? 0 : a.severity === 'error' ? -1 : 1));

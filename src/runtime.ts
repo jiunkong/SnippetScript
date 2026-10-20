@@ -1,3 +1,5 @@
+import { fromNative, toNative, boxVariables, writeBackVariables } from './value-codec.js';
+import { ScriptValue, NumberValue, StringValue, BoolValue, ListValue, UNDEFINED } from './type-system.js';
 import { analyze, parseExpression, SnippetTemplate } from './analyzer.js';
 import { SnippetError, createSnippetError } from './errors.js';
 import { SnippetFragment } from './fragment.js';
@@ -111,11 +113,11 @@ function variable(node: Expr & {
 }
 function binaryShort(node: Expr & {
     kind: 'binary';
-}, left: any): boolean | undefined {
+}, left: Value): Value | undefined {
     if (node.operator === '&&' && !snippetBooleanValue(left))
-        return false;
+        return new BoolValue(false);
     if (node.operator === '||' && snippetBooleanValue(left))
-        return true;
+        return new BoolValue(true);
     return undefined;
 }
 function locate(error: any, range: SourceRange, context: Context) {
@@ -125,7 +127,7 @@ function locate(error: any, range: SourceRange, context: Context) {
         error.callTrace = context.stack.map(snippet => snippet.name || '');
     }
 }
-async function evaluate(node: Expr, args: Variables, context: Context): Promise<any> {
+async function evaluate(node: Expr, args: Variables, context: Context): Promise<Value> {
     const execution = context.execution;
     execution.check();
     try {
@@ -134,7 +136,7 @@ async function evaluate(node: Expr, args: Variables, context: Context): Promise<
             case 'variable':
             case 'loop': return variable(node, args);
             case 'list': {
-                const values: any[] = [];
+                const values: Value[] = [];
                 for (const item of node.items)
                     values.push(await evaluate(item, args, context));
                 return createList(values);
@@ -150,13 +152,13 @@ async function evaluate(node: Expr, args: Variables, context: Context): Promise<
                 if (short !== undefined)
                     return short;
                 const right = await evaluate(node.right, args, context);
-                return node.operator === '&&' || node.operator === '||' ? snippetBooleanValue(right) : binaryValue(node.operator, left, right, execution);
+                return node.operator === '&&' || node.operator === '||' ? new BoolValue(snippetBooleanValue(right)) : binaryValue(node.operator, left, right, execution);
             }
             case 'conditional': return evaluate(snippetConditionValue(await evaluate(node.condition, args, context)) ? node.yes : node.no, args, context);
             case 'fragment': return solve(node.template, { ...args }, { ...context, loopControl: undefined });
             case 'call': {
                 validateFunction(node.name, node.args.length);
-                const values: any[] = [];
+                const values: Value[] = [];
                 for (const arg of node.args)
                     values.push(await evaluate(arg, args, context));
                 const ranges = node.args.map(arg => arg.range);
@@ -170,7 +172,7 @@ async function evaluate(node: Expr, args: Variables, context: Context): Promise<
                     },
                     invokeHost: async (values: readonly Value[]) => {
                         if (!context.host) throw createSnippetError('err_host_function_unavailable', [node.name]);
-                        return execution.wait(() => context.host!.invoke({ name: node.name, args: values, sourceRange: node.range }, { signal: execution.signal }), spec.userInput);
+                        return fromNative(await execution.wait(() => context.host!.invoke({ name: node.name, args: values, sourceRange: node.range }, { signal: execution.signal }), spec.userInput));
                     },
                 };
                 return spec.execute ? spec.execute(values, capabilities) : await spec.executeAsync(values, capabilities);
@@ -186,7 +188,7 @@ async function evaluate(node: Expr, args: Variables, context: Context): Promise<
                     throw createSnippetError('err_snippet_call_depth', [context.maxCallDepth, node.name]);
                 const childArgs: Variables = {};
                 const argumentContext = { ...context, stack: [...context.stack, target] };
-                const values: unknown[] = [];
+                const values: Value[] = [];
                 for (const argument of node.args)
                     values.push(await evaluate(argument, args, argumentContext));
                 validateSnippetCallArguments(node.name, values, node.args.map(argument => argument.range));
@@ -195,7 +197,7 @@ async function evaluate(node: Expr, args: Variables, context: Context): Promise<
                 let offset = 0;
                 if (node.offset) {
                     const value = await evaluate(node.offset, args, argumentContext);
-                    offset = typeof value === 'number' ? value : NaN;
+                    offset = value instanceof NumberValue ? value.value : NaN;
                     if (!Number.isSafeInteger(offset) || offset < 0)
                         throw createSnippetError('err_snippet_cursor_offset');
                 }
@@ -213,9 +215,9 @@ async function evaluate(node: Expr, args: Variables, context: Context): Promise<
 }
 async function solve(template: SnippetTemplate, args: Variables, context: Context): Promise<SnippetFragment> {
     const nodes: any[] = [], newlyCreated = new Set<string>();
-    const append = (value: any) => { for (const node of SnippetFragment.from(value).nodes)
+    const append = (value: Value) => { for (const node of SnippetFragment.from(value).nodes)
         nodes.push(node); };
-    const setVar = (name: string, value: any) => { if (!Object.prototype.hasOwnProperty.call(args, name))
+    const setVar = (name: string, value: Value) => { if (!Object.prototype.hasOwnProperty.call(args, name))
         newlyCreated.add(name); Object.defineProperty(args, name, { value, writable: true, enumerable: true, configurable: true }); };
     try {
         for (const node of template.nodes) {
@@ -232,7 +234,8 @@ async function solve(template: SnippetTemplate, args: Variables, context: Contex
                         append(await evaluate(node.expression, args, context));
                         break;
                     case 'cursorExpression': {
-                        const level = await evaluate(node.expression, args, context);
+                        const levelValue = await evaluate(node.expression, args, context);
+                        const level = levelValue instanceof NumberValue ? levelValue.value : NaN;
                         if (!Number.isSafeInteger(level) || level < 0)
                             throw createSnippetError('err_cursor_level');
                         nodes.push({ type: 'cursor', level });
@@ -240,8 +243,8 @@ async function solve(template: SnippetTemplate, args: Variables, context: Contex
                     }
                     case 'set':
                         for (const assignment of node.assignments) {
-                            const value = assignment.expression ? await evaluate(assignment.expression, args, context) : undefined;
-                            setVar(assignment.name, assignment.operator && assignment.operator !== '=' ? binaryValue(assignment.operator[0], args[assignment.name] ?? 0, value, context.execution) : value);
+                            const value = assignment.expression ? await evaluate(assignment.expression, args, context) : UNDEFINED;
+                            setVar(assignment.name, assignment.operator && assignment.operator !== '=' ? binaryValue(assignment.operator[0], (!args[assignment.name] || ['null','undefined'].includes(args[assignment.name].kind) ? fromNative(0) : args[assignment.name]), value, context.execution) : value);
                         }
                         break;
                     case 'break':
@@ -252,9 +255,9 @@ async function solve(template: SnippetTemplate, args: Variables, context: Contex
                         break;
                     case 'for': {
                         const iterable = await evaluate(node.expression, args, context), range = isRange(iterable);
-                        const iterator = !range && isSnippetIterable(iterable) ? iterable instanceof SnippetFragment ? iterable.iterate(context.execution) : (iterable as string | any[])[Symbol.iterator]() : undefined;
+                        const iterator = !range && isSnippetIterable(iterable) ? iterable instanceof SnippetFragment ? iterable.iterate(context.execution) : (iterable instanceof ListValue ? iterable.value : Array.from((iterable as StringValue).value, fromNative))[Symbol.iterator]() : undefined;
                         const start = range ? iterable.start : 0, step = range && iterable.end < iterable.start ? -1 : 1;
-                        const count = iterator ? 0 : range ? Math.abs(iterable.end - iterable.start) + 1 : parseInt(iterable, 10) || 0;
+                        const count = iterator ? 0 : range ? Math.abs(iterable.end - iterable.start) + 1 : parseInt(String(iterable), 10) || 0;
                         const hadIndex = Object.prototype.hasOwnProperty.call(args, 'index'), oldIndex = args.index;
                         const hadValue = Object.prototype.hasOwnProperty.call(args, SNIPPET_LOOP_VALUE), oldValue = args[SNIPPET_LOOP_VALUE];
                         const loopContext: Context = { ...context, loopControl: {} };
@@ -263,8 +266,8 @@ async function solve(template: SnippetTemplate, args: Variables, context: Contex
                                 const next = iterator?.next();
                                 if (next?.done)
                                     break;
-                                args.index = i;
-                                args[SNIPPET_LOOP_VALUE] = iterator ? next!.value : start + i * step;
+                                args.index = fromNative(i);
+                                args[SNIPPET_LOOP_VALUE] = iterator ? next!.value : fromNative(start + i * step);
                                 loopContext.loopControl!.type = undefined;
                                 append(await solve(node.body, args, loopContext));
                                 if (loopContext.loopControl!.type === 'break')
@@ -355,10 +358,13 @@ async function runAnalysis(analysis: Analysis, args: Variables, context: Context
 }
 export async function execute(analysis: Analysis, options: ExecuteOptions = {}): Promise<SnippetFragment> {
     const execution = new Execution(options.limits?.timeoutMs, options.environment, options.signal);
+    const scope = boxVariables(options.variables || {});
+    const beforeScope = { ...scope };
     try {
-        return await runAnalysis(analysis, options.variables || {}, { execution, library: options.library || [], host: options.host, maxCallDepth: normalizeSnippetCallDepth(options.limits?.maxCallDepth), stack: [], name: '', source: analysis.source });
+        return await runAnalysis(analysis, scope, { execution, library: options.library || [], host: options.host, maxCallDepth: normalizeSnippetCallDepth(options.limits?.maxCallDepth), stack: [], name: '', source: analysis.source });
     }
     finally {
+        if (options.variables) writeBackVariables(options.variables, scope, beforeScope);
         execution.dispose();
     }
 }
@@ -393,20 +399,23 @@ export async function processTemplate(input: string | Snippet | SnippetTemplate,
     const source = typeof input === 'string' ? input : input instanceof SnippetTemplate ? input.source : input.replacement || '';
     const analysis = input instanceof SnippetTemplate ? { source, template: input, variableTypes: [], callSignatures: [], diagnostics: [], tokens: [], regions: [], references: [] } : snippet ? prepareSnippetTemplate(snippet).analysis : analyze(source, { checkVariables: false, forDepth: Object.prototype.hasOwnProperty.call(args, 'index') ? 1 : 0 });
     const execution = options.execution || new Execution(options.maxExecutionMs, options.environment, options.signal);
+    const scope = boxVariables(args);
+    const beforeScope = { ...scope };
     try {
-        return await runAnalysis(analysis, args, { execution, library: options.snippets || [], host: options.host, maxCallDepth: normalizeSnippetCallDepth(options.maxCallDepth), stack: options.stack || (snippet ? [snippet] : []), name: snippet?.name || options.stack?.at(-1)?.name || '', source, loopControl: options.loopControl });
+        return await runAnalysis(analysis, scope, { execution, library: options.snippets || [], host: options.host, maxCallDepth: normalizeSnippetCallDepth(options.maxCallDepth), stack: options.stack || (snippet ? [snippet] : []), name: snippet?.name || options.stack?.at(-1)?.name || '', source, loopControl: options.loopControl });
     }
     finally {
+        writeBackVariables(args, scope, beforeScope);
         if (!options.execution)
             execution.dispose();
     }
 }
 // Synchronous convenience API for pure expressions. Execution of templates uses
 // the already parsed AST above, never this source-based convenience wrapper.
-export function evaluateExpression(source: string, args: Variables = {}, execution?: any, environment: Environment = defaultEnvironment): any {
-    return evaluatePure(parseExpression(source), args, execution, environment);
+export function evaluateExpression(source: string, args: Variables = {}, execution?: any, environment: Environment = defaultEnvironment): Value {
+    return evaluatePure(parseExpression(source), boxVariables(args), execution, environment);
 }
-function evaluatePure(node: Expr, args: Variables, execution: any, environment: Environment): any {
+function evaluatePure(node: Expr, args: Variables, execution: any, environment: Environment): Value {
     execution?.check();
     const evalNode = (child: Expr) => evaluatePure(child, args, execution, environment);
     switch (node.kind) {
@@ -422,7 +431,7 @@ function evaluatePure(node: Expr, args: Variables, execution: any, environment: 
             if (short !== undefined)
                 return short;
             const right = evalNode(node.right);
-            return node.operator === '&&' || node.operator === '||' ? snippetBooleanValue(right) : binaryValue(node.operator, left, right, execution);
+            return node.operator === '&&' || node.operator === '||' ? new BoolValue(snippetBooleanValue(right)) : binaryValue(node.operator, left, right, execution);
         }
         case 'call': if (FUNCTIONS[node.name]?.execute)
             return callBuiltinFunction(node.name, node.args.map(evalNode), execution, environment, node.args.map(arg => arg.range));

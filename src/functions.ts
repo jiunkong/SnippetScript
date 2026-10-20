@@ -1,12 +1,16 @@
+import { Type, Types, typeFromNames, typeInfo, ListType, UnionType, ScriptValue } from './type-system.js';
+import { fromNative, toNative } from './value-codec.js';
 import { SnippetFragment, snippetIterableItems, snippetFragmentFromUnits, snippetFragmentMatchAt, snippetFragmentReplace, snippetFragmentSplit } from './fragment.js';
-import { checkNumberResult, createList, snippetConditionValue, snippetValuesEqual, isSnippetIterable } from './value-operations.js';
+import { checkNumberResult, createList, snippetConditionValue, snippetValuesEqual, isSnippetIterable } from './native-values.js';
 import { isRange, valueTypeOf } from './value-type.js';
 import { SnippetError, createSnippetError } from './errors.js';
 import type { Environment, ExecutionCheck, SourceRange, TokenKind, Value, ValueType } from './types.js';
 export type ParameterTypes = readonly ValueType[] | 'any';
 export interface FunctionParameter {
+    readonly type: Type;
     readonly name: string;
     readonly types: ParameterTypes;
+    readonly requiredType?: Type;
     readonly elementTypes?: readonly ValueType[];
     readonly requiredElementTypes?: readonly ValueType[];
 }
@@ -16,10 +20,12 @@ export interface FunctionOverload {
     readonly max: number;
     readonly parameters: readonly FunctionParameter[];
     readonly restParameter?: FunctionParameter;
+    readonly returnType: Type;
     readonly returnTypes: ParameterTypes;
     readonly returnElementTypes?: readonly ValueType[];
 }
 export interface OverloadArgument {
+    readonly type: Type;
     readonly types: readonly ValueType[];
     readonly elements?: readonly ValueType[];
     readonly exactElements?: boolean;
@@ -38,12 +44,15 @@ export interface AsyncFunctionExecutionContext extends FunctionExecutionContext 
     solveFragment(source: string): Promise<SnippetFragment>;
 }
 export interface FunctionTypeInfo {
+    readonly type: Type;
     readonly types: readonly ValueType[];
     readonly elements?: readonly ValueType[];
     readonly exactElements?: boolean;
 }
-export type FunctionHandler = (values: any[], context: FunctionExecutionContext) => Value;
-export type AsyncFunctionHandler = (values: any[], context: AsyncFunctionExecutionContext) => Promise<Value>;
+export type FunctionHandler = (values: Value[], context: FunctionExecutionContext) => Value;
+type NativeFunctionHandler = (values: any[], context: FunctionExecutionContext) => any;
+export type AsyncFunctionHandler = (values: Value[], context: AsyncFunctionExecutionContext) => Promise<Value>;
+type NativeAsyncFunctionHandler = (values: any[], context: AsyncFunctionExecutionContext) => Promise<any>;
 export type FunctionReturnInference = (args: readonly OverloadArgument[], overloads: readonly FunctionOverload[]) => FunctionTypeInfo;
 interface FunctionBehavior {
     readonly kind?: TokenKind;
@@ -62,30 +71,48 @@ export type FunctionSpec = Readonly<FunctionBehavior & FunctionImplementation & 
     readonly kind: TokenKind;
 }>;
 type OverloadDefinition = Omit<FunctionOverload, 'id'>;
-type FunctionDefinition = FunctionBehavior & FunctionImplementation & { readonly overloads: readonly OverloadDefinition[] };
+type NativeImplementation = { readonly execute: NativeFunctionHandler; readonly executeAsync?: never } | { readonly execute?: never; readonly executeAsync: NativeAsyncFunctionHandler };
+type NativeTypeInfo = Omit<FunctionTypeInfo, 'type'> & { readonly type?: Type };
+type NativeReturnInference = (args: readonly OverloadArgument[], overloads: readonly FunctionOverload[]) => NativeTypeInfo;
+type FunctionDefinition = Omit<FunctionBehavior, 'inferReturn'> & { readonly inferReturn?: NativeReturnInference } & NativeImplementation & { readonly overloads: readonly OverloadDefinition[] };
 
-const text: readonly ValueType[] = Object.freeze(['string', 'fragment']);
-const parameter = (name: string, types: ParameterTypes, elementTypes?: readonly ValueType[], requiredElementTypes?: readonly ValueType[]): FunctionParameter => Object.freeze({
-    name, types: types === 'any' ? types : Object.freeze([...types]),
-    elementTypes: elementTypes && Object.freeze([...elementTypes]),
-    requiredElementTypes: requiredElementTypes && Object.freeze([...requiredElementTypes]),
-});
-const string = (name: string) => parameter(name, ['string']);
-const number = (name: string) => parameter(name, ['number']);
-const value = (name: string) => parameter(name, 'any');
-function overload(parameters: readonly FunctionParameter[], returnTypes: ParameterTypes, min = parameters.length, max = parameters.length,
-    restParameter?: FunctionParameter, returnElementTypes?: readonly ValueType[]): OverloadDefinition {
-    return Object.freeze({ parameters: Object.freeze([...parameters]), returnTypes: returnTypes === 'any' ? returnTypes : Object.freeze([...returnTypes]),
-        min, max, restParameter, returnElementTypes: returnElementTypes && Object.freeze([...returnElementTypes]) });
+const text = UnionType.of(Types.string, Types.fragment);
+function declaredType(source: ParameterTypes | Type): Type {
+    return source instanceof Type ? source : source === 'any' ? Types.any : typeFromNames(source);
+}
+function parameter(name: string, source: ParameterTypes | Type, elements?: readonly ValueType[] | Type, required?: readonly ValueType[] | Type): FunctionParameter {
+    const element = elements && (elements instanceof Type ? elements : typeFromNames(elements));
+    const base = declaredType(source);
+    const type = base.kind === 'list' && element ? new ListType(element) : base;
+    const requiredType = required && (required instanceof Type ? required : typeFromNames(required));
+    return Object.freeze({ name, type, requiredType,
+        get types() { return type.kind === 'any' ? 'any' as const : type.names; },
+        get elementTypes() { return element?.names; },
+        get requiredElementTypes() { return requiredType?.names; },
+    });
+}
+const string = (name: string) => parameter(name, Types.string);
+const number = (name: string) => parameter(name, Types.number);
+const value = (name: string) => parameter(name, Types.any);
+function overload(parameters: readonly FunctionParameter[], source: ParameterTypes | Type, min = parameters.length, max = parameters.length,
+    restParameter?: FunctionParameter, elements?: readonly ValueType[] | Type): OverloadDefinition {
+    const base = declaredType(source);
+    const element = elements && (elements instanceof Type ? elements : typeFromNames(elements));
+    const returnType = base.kind === 'list' && element ? new ListType(element) : base;
+    return Object.freeze({ parameters: Object.freeze([...parameters]), returnType,
+        get returnTypes() { return returnType.kind === 'any' ? 'any' as const : returnType.names; },
+        min, max, restParameter, get returnElementTypes() { return element?.names; },
+    });
 }
 function defineFunctions(definitions: Record<string, FunctionDefinition>): Readonly<Record<string, FunctionSpec>> {
     return Object.freeze(Object.fromEntries(Object.entries(definitions).map(([name, definition]) => {
         const { execute, executeAsync, ...behavior } = definition;
         const implementation: FunctionImplementation = execute
-            ? { execute: (values, context) => checkNumberResult(execute(values, context)) }
-            : { executeAsync: async (values, context) => checkNumberResult(await executeAsync!(values, context)) };
+            ? { execute: (values, context) => fromNative(checkNumberResult(execute(values.map(toNative), context))) }
+            : { executeAsync: async (values, context) => fromNative(checkNumberResult(await executeAsync!(values.map(toNative), context))) };
         return [name, Object.freeze({
-            ...behavior, ...implementation, kind: definition.kind ?? 'function',
+            ...behavior, ...implementation,
+            inferReturn: definition.inferReturn && ((args: readonly OverloadArgument[], overloads: readonly FunctionOverload[]) => { const result = definition.inferReturn!(args, overloads); return { ...typeInfo(result.type ?? typeFromNames(result.types, result.elements), result.exactElements) }; }), kind: definition.kind ?? 'function',
             min: Math.min(...definition.overloads.map(overload => overload.min)),
             max: Math.max(...definition.overloads.map(overload => overload.max)),
             overloads: Object.freeze(definition.overloads.map((overload, index) => Object.freeze({ ...overload, id: `${name}:${index}` }))),
@@ -95,10 +122,10 @@ function defineFunctions(definitions: Record<string, FunctionDefinition>): Reado
 
 // Host implementations remain in the embedding application. Normalization,
 // cancellation and failure policy are part of the language's function definition.
-function host(options: { result?: (value: Value) => Value; failure?: (error: any) => Value } = {}): AsyncFunctionHandler {
+function host(options: { result?: (value: any) => any; failure?: (error: any) => any } = {}): NativeAsyncFunctionHandler {
     return async (values, context) => {
-        let result: Value;
-        try { result = await context.invokeHost(values); }
+        let result: any;
+        try { result = toNative(await context.invokeHost(values.map(fromNative))); }
         catch (error) {
             if (error?.code === 'err_snippet_timeout' || error?.code === 'err_snippet_cancelled' || error?.code === 'err_host_function_unavailable' || !options.failure) throw error;
             result = options.failure(error);
@@ -111,7 +138,7 @@ function host(options: { result?: (value: Value) => Value; failure?: (error: any
         return options.result ? options.result(result) : String(result ?? '');
     };
 }
-function textTransform(transform: (text: string, first: boolean, fragment: boolean) => string, trimEdges = false): FunctionHandler {
+function textTransform(transform: (text: string, first: boolean, fragment: boolean) => string, trimEdges = false): NativeFunctionHandler {
     return ([value], { execution }) => {
         if (!(value instanceof SnippetFragment)) return transform(value, true, false);
         let first = true;
@@ -128,7 +155,7 @@ function textTransform(transform: (text: string, first: boolean, fragment: boole
         }));
     };
 }
-function textBoundary(atEnd: boolean): FunctionHandler {
+function textBoundary(atEnd: boolean): NativeFunctionHandler {
     return (items, { execution }) => {
         if (items[0] instanceof SnippetFragment || items[1] instanceof SnippetFragment) {
             const units = snippetIterableItems(SnippetFragment.from(items[0]), execution);
@@ -138,7 +165,7 @@ function textBoundary(atEnd: boolean): FunctionHandler {
         return atEnd ? items[0].endsWith(items[1]) : items[0].startsWith(items[1]);
     };
 }
-function editIterable(insert: boolean): FunctionHandler {
+function editIterable(insert: boolean): NativeFunctionHandler {
     return (values, { execution }) => {
         let target = values[0];
         const index = values[1];
@@ -155,7 +182,14 @@ function editIterable(insert: boolean): FunctionHandler {
     };
 }
 const uniqueTypes = (types: readonly ValueType[]): ValueType[] => types.includes('unknown') ? ['unknown'] : [...new Set(types)];
-const preserveListElements: FunctionReturnInference = (args, overloads) => ({
+function listArgumentElement(argument?: OverloadArgument): Type {
+    const type = argument?.type;
+    if (type instanceof ListType) return type.element;
+    if (type instanceof UnionType) return UnionType.of(...type.members.filter(member => member instanceof ListType).map(member => (member as ListType).element));
+    return Types.unknown;
+}
+const preserveListElements: NativeReturnInference = (args, overloads) => ({
+    type: UnionType.of(...overloads.map(overload => overload.returnType instanceof ListType ? new ListType(listArgumentElement(args[0])) : overload.returnType)),
     types: uniqueTypes(overloads.flatMap(overload => overload.returnTypes === 'any' ? ['unknown'] : overload.returnTypes)),
     elements: args[0]?.elements ?? ['unknown'],
 });
@@ -180,92 +214,96 @@ export function formatDate(date: Date, format: string) {
     };
     return format.replace(/YYYY|YY|MM|M|DD|D|HH|H|mm|m|ss|s|dddd|ddd/g, match => String(tokens[match]));
 }
-export function sampleRandom(values: readonly Value[], environment: Environment) {
+function sampleRandomNative(values: readonly any[], environment: Environment) {
     const evaluated = values.map(value => isRange(value) ? Math.min(value.start, value.end) + Math.floor(environment.random() * (Math.abs(value.end - value.start) + 1)) : value);
     return evaluated.length === 1 ? evaluated[0] : evaluated[Math.floor(environment.random() * evaluated.length)];
+}
+
+export function sampleRandom(values: readonly Value[], environment: Environment): Value {
+    return fromNative(sampleRandomNative(values.map(toNative), environment));
 }
 
 export const FUNCTIONS = defineFunctions({
     url: {
         overloads: [
-            overload([], ['string']),
+            overload([], Types.string),
         ],
         host: true,
         executeAsync: host(),
     },
     domain: {
         overloads: [
-            overload([], ['string']),
+            overload([], Types.string),
         ],
         host: true,
         executeAsync: host(),
     },
     title: {
         overloads: [
-            overload([], ['string']),
+            overload([], Types.string),
         ],
         host: true,
         executeAsync: host(),
     },
     uuid: {
         overloads: [
-            overload([], ['string']),
+            overload([], Types.string),
         ],
         kind: 'randomFunction',
         execute: (_values, { environment }) => environment.uuid(),
     },
     bs: {
         overloads: [
-            overload([], ['string']),
+            overload([], Types.string),
         ],
         execute: () => '\u0008',
     },
     backspace: {
         overloads: [
-            overload([], ['string']),
+            overload([], Types.string),
         ],
         execute: () => '\u0008',
     },
     newline: {
         overloads: [
-            overload([], ['string']),
+            overload([], Types.string),
         ],
         execute: () => '\n',
     },
     nl: {
         overloads: [
-            overload([], ['string']),
+            overload([], Types.string),
         ],
         execute: () => '\n',
     },
     paste: {
         overloads: [
-            overload([], ['string']),
+            overload([], Types.string),
         ],
         host: true,
         executeAsync: host({ failure: () => '' }),
     },
     date: {
         overloads: [
-            overload([string('format')], ['string'], 0, 1),
+            overload([string('format')], Types.string, 0, 1),
         ],
         execute: (values, { environment }) => formatDate(environment.date(), values[0] || 'YYYY-MM-DD'),
     },
     time: {
         overloads: [
-            overload([string('format')], ['string'], 0, 1),
+            overload([string('format')], Types.string, 0, 1),
         ],
         execute: (values, { environment }) => formatDate(environment.date(), values[0] || 'HH:mm'),
     },
     datetime: {
         overloads: [
-            overload([string('format')], ['string'], 0, 1),
+            overload([string('format')], Types.string, 0, 1),
         ],
         execute: (values, { environment }) => formatDate(environment.date(), values[0] || 'YYYY-MM-DD HH:mm'),
     },
     prompt: {
         overloads: [
-            overload([string('message')], ['string'], 0, 1),
+            overload([string('message')], Types.string, 0, 1),
         ],
         host: true,
         userInput: true,
@@ -273,17 +311,17 @@ export const FUNCTIONS = defineFunctions({
     },
     random: {
         overloads: [
-            overload([], 'any', 1, Infinity, value('value')),
+            overload([], Types.any, 1, Infinity, value('value')),
         ],
         kind: 'randomFunction',
-        execute: (values, { environment }) => sampleRandom(values, environment),
-        inferReturn: args => ({ types: uniqueTypes(args.length ? args.flatMap(value => value.types.map(type => type === 'range' ? 'number' : type)) : ['unknown']),
+        execute: (values, { environment }) => sampleRandomNative(values, environment),
+        inferReturn: args => ({ type: args.length ? UnionType.of(...args.map(arg => arg.type.kind === 'range' ? Types.number : arg.type)) : Types.unknown, types: uniqueTypes(args.length ? args.flatMap(value => value.types.map(type => type === 'range' ? 'number' : type)) : ['unknown']),
             elements: uniqueTypes(args.filter(value => value.types.includes('list')).flatMap(value => value.elements ?? ['unknown'])),
             exactElements: args.length > 0 && args.every(value => value.exactElements) && args.every(value => JSON.stringify(value.elements) === JSON.stringify(args[0].elements)) }),
     },
     choice: {
         overloads: [
-            overload([string('title')], ['string'], 2, Infinity, string('option')),
+            overload([string('title')], Types.string, 2, Infinity, string('option')),
         ],
         host: true,
         userInput: true,
@@ -291,36 +329,36 @@ export const FUNCTIONS = defineFunctions({
     },
     upper: {
         overloads: [
-            overload([string('text')], ['string']),
-            overload([parameter('text', ['fragment'])], ['fragment']),
+            overload([string('text')], Types.string),
+            overload([parameter('text', Types.fragment)], Types.fragment),
         ],
         execute: textTransform(text => text.toUpperCase()),
     },
     lower: {
         overloads: [
-            overload([string('text')], ['string']),
-            overload([parameter('text', ['fragment'])], ['fragment']),
+            overload([string('text')], Types.string),
+            overload([parameter('text', Types.fragment)], Types.fragment),
         ],
         execute: textTransform(text => text.toLowerCase()),
     },
     trim: {
         overloads: [
-            overload([string('text')], ['string']),
-            overload([parameter('text', ['fragment'])], ['fragment']),
+            overload([string('text')], Types.string),
+            overload([parameter('text', Types.fragment)], Types.fragment),
         ],
         execute: textTransform(text => text.trim(), true),
     },
     capitalize: {
         overloads: [
-            overload([string('text')], ['string']),
-            overload([parameter('text', ['fragment'])], ['fragment']),
+            overload([string('text')], Types.string),
+            overload([parameter('text', Types.fragment)], Types.fragment),
         ],
         execute: textTransform((text, first, fragment) => !first ? text : fragment ? String.fromCodePoint(text.codePointAt(0)!).toUpperCase() + text.slice(text.codePointAt(0)! > 0xffff ? 2 : 1) : text.charAt(0).toUpperCase() + text.slice(1)),
     },
     substr: {
         overloads: [
-            overload([string('text'), number('start'), number('count')], ['string'], 2, 3),
-            overload([parameter('text', ['fragment']), number('start'), number('count')], ['fragment'], 2, 3),
+            overload([string('text'), number('start'), number('count')], Types.string, 2, 3),
+            overload([parameter('text', Types.fragment), number('start'), number('count')], Types.fragment, 2, 3),
         ],
         arityError: 'err_substr_args',
         execute: (values, { execution }) => {
@@ -340,10 +378,10 @@ export const FUNCTIONS = defineFunctions({
     },
     replace: {
         overloads: [
-            overload([string('text'), string('search'), string('replacement')], ['string']),
-            overload([parameter('text', ['fragment']), parameter('search', text), parameter('replacement', text)], ['fragment']),
-            overload([string('text'), parameter('search', ['fragment']), parameter('replacement', text)], ['fragment']),
-            overload([string('text'), string('search'), parameter('replacement', ['fragment'])], ['fragment']),
+            overload([string('text'), string('search'), string('replacement')], Types.string),
+            overload([parameter('text', Types.fragment), parameter('search', text), parameter('replacement', text)], Types.fragment),
+            overload([string('text'), parameter('search', Types.fragment), parameter('replacement', text)], Types.fragment),
+            overload([string('text'), string('search'), parameter('replacement', Types.fragment)], Types.fragment),
         ],
         arityError: 'err_replace_args',
         execute: (values, { execution }) => {
@@ -355,10 +393,10 @@ export const FUNCTIONS = defineFunctions({
     },
     len: {
         overloads: [
-            overload([string('iterable')], ['number']),
-            overload([parameter('iterable', ['fragment'])], ['number']),
-            overload([parameter('iterable', ['list'])], ['number']),
-            overload([parameter('iterable', ['range'])], ['number']),
+            overload([string('iterable')], Types.number),
+            overload([parameter('iterable', Types.fragment)], Types.number),
+            overload([parameter('iterable', new ListType(Types.unknown))], Types.number),
+            overload([parameter('iterable', Types.range)], Types.number),
         ],
         execute: (values, { execution }) => {
             const value = values[0];
@@ -371,26 +409,26 @@ export const FUNCTIONS = defineFunctions({
     },
     startswith: {
         overloads: [
-            overload([string('text'), parameter('search', text)], ['bool']),
-            overload([parameter('text', ['fragment']), parameter('search', text)], ['bool']),
+            overload([string('text'), parameter('search', text)], Types.bool),
+            overload([parameter('text', Types.fragment), parameter('search', text)], Types.bool),
         ],
         arityError: 'err_fn_two_args_exact',
         execute: textBoundary(false),
     },
     endswith: {
         overloads: [
-            overload([string('text'), parameter('search', text)], ['bool']),
-            overload([parameter('text', ['fragment']), parameter('search', text)], ['bool']),
+            overload([string('text'), parameter('search', text)], Types.bool),
+            overload([parameter('text', Types.fragment), parameter('search', text)], Types.bool),
         ],
         arityError: 'err_fn_two_args_exact',
         execute: textBoundary(true),
     },
     includes: {
         overloads: [
-            overload([string('iterable'), parameter('value', text)], ['bool']),
-            overload([parameter('iterable', ['fragment']), parameter('value', text)], ['bool']),
-            overload([parameter('list', ['list']), value('value')], ['bool']),
-            overload([parameter('range', ['range']), number('value')], ['bool']),
+            overload([string('iterable'), parameter('value', text)], Types.bool),
+            overload([parameter('iterable', Types.fragment), parameter('value', text)], Types.bool),
+            overload([parameter('list', new ListType(Types.unknown)), value('value')], Types.bool),
+            overload([parameter('range', Types.range), number('value')], Types.bool),
         ],
         arityError: 'err_fn_two_args_exact',
         execute: (values, { execution }) => {
@@ -420,7 +458,7 @@ export const FUNCTIONS = defineFunctions({
     },
     toast: {
         overloads: [
-            overload([string('message'), string('color'), number('durationSeconds')], ['undefined'], 2, 3),
+            overload([string('message'), string('color'), number('durationSeconds')], Types.undefined, 2, 3),
         ],
         arityError: 'err_toast_args',
         host: true,
@@ -429,8 +467,8 @@ export const FUNCTIONS = defineFunctions({
     },
     copy: {
         overloads: [
-            overload([string('text')], ['undefined']),
-            overload([parameter('text', ['fragment'])], ['undefined']),
+            overload([string('text')], Types.undefined),
+            overload([parameter('text', Types.fragment)], Types.undefined),
         ],
         arityError: 'err_fn_one_arg_exact',
         host: true,
@@ -438,7 +476,7 @@ export const FUNCTIONS = defineFunctions({
     },
     type: {
         overloads: [
-            overload([value('value')], ['string']),
+            overload([value('value')], Types.string),
         ],
         kind: 'typeFunction',
         arityError: 'err_fn_one_arg_exact',
@@ -446,7 +484,7 @@ export const FUNCTIONS = defineFunctions({
     },
     isCursor: {
         overloads: [
-            overload([parameter('fragment', ['fragment'])], ['bool']),
+            overload([parameter('fragment', Types.fragment)], Types.bool),
         ],
         arityError: 'err_fn_one_arg_exact',
         execute: (values) => {
@@ -456,7 +494,7 @@ export const FUNCTIONS = defineFunctions({
     },
     hasCursor: {
         overloads: [
-            overload([parameter('fragment', ['fragment'])], ['bool']),
+            overload([parameter('fragment', Types.fragment)], Types.bool),
         ],
         arityError: 'err_fn_one_arg_exact',
         execute: (values, { execution }) => {
@@ -469,9 +507,9 @@ export const FUNCTIONS = defineFunctions({
     },
     split: {
         overloads: [
-            overload([string('text'), string('separator')], ['list'], 2, 2, undefined, ['string']),
-            overload([parameter('text', ['fragment']), parameter('separator', text)], ['list'], 2, 2, undefined, ['fragment']),
-            overload([string('text'), parameter('separator', ['fragment'])], ['list'], 2, 2, undefined, ['fragment']),
+            overload([string('text'), string('separator')], new ListType(Types.unknown), 2, 2, undefined, Types.string),
+            overload([parameter('text', Types.fragment), parameter('separator', text)], new ListType(Types.unknown), 2, 2, undefined, Types.fragment),
+            overload([string('text'), parameter('separator', Types.fragment)], new ListType(Types.unknown), 2, 2, undefined, Types.fragment),
         ],
         arityError: 'err_fn_two_args_exact',
         execute: (values, { execution }) => {
@@ -484,9 +522,9 @@ export const FUNCTIONS = defineFunctions({
     },
     join: {
         overloads: [
-            overload([parameter('list', ['list'], ['string']), string('separator')], ['string']),
-            overload([parameter('list', ['list'], text), parameter('separator', ['fragment'])], ['fragment']),
-            overload([parameter('list', ['list'], text, ['fragment']), string('separator')], ['fragment']),
+            overload([parameter('list', new ListType(Types.unknown), Types.string), string('separator')], Types.string),
+            overload([parameter('list', new ListType(Types.unknown), text), parameter('separator', Types.fragment)], Types.fragment),
+            overload([parameter('list', new ListType(Types.unknown), text, Types.fragment), string('separator')], Types.fragment),
         ],
         arityError: 'err_fn_two_args_exact',
         execute: (values, { execution }) => {
@@ -509,21 +547,22 @@ export const FUNCTIONS = defineFunctions({
     },
     insertAt: {
         overloads: [
-            overload([string('text'), number('index'), string('value')], ['string']),
-            overload([string('text'), number('index'), parameter('value', ['fragment'])], ['fragment']),
-            overload([parameter('fragment', ['fragment']), number('index'), parameter('value', text)], ['fragment']),
-            overload([parameter('list', ['list']), number('index'), value('value')], ['list']),
+            overload([string('text'), number('index'), string('value')], Types.string),
+            overload([string('text'), number('index'), parameter('value', Types.fragment)], Types.fragment),
+            overload([parameter('fragment', Types.fragment), number('index'), parameter('value', text)], Types.fragment),
+            overload([parameter('list', new ListType(Types.unknown)), number('index'), value('value')], new ListType(Types.unknown)),
         ],
         arityError: 'err_fn_three_args_exact',
         execute: editIterable(true),
         inferReturn: (args, overloads) => ({ ...preserveListElements(args, overloads),
+            type: UnionType.of(...overloads.map(overload => overload.returnType instanceof ListType ? new ListType(UnionType.of(listArgumentElement(args[0]), args[2]?.type ?? Types.unknown)) : overload.returnType)),
             elements: uniqueTypes([...(args[0]?.elements ?? ['unknown']), ...(args[2]?.types ?? ['unknown'])]) }),
     },
     removeAt: {
         overloads: [
-            overload([string('iterable'), number('index')], ['string']),
-            overload([parameter('iterable', ['fragment']), number('index')], ['fragment']),
-            overload([parameter('iterable', ['list']), number('index')], ['list']),
+            overload([string('iterable'), number('index')], Types.string),
+            overload([parameter('iterable', Types.fragment), number('index')], Types.fragment),
+            overload([parameter('iterable', new ListType(Types.unknown)), number('index')], new ListType(Types.unknown)),
         ],
         arityError: 'err_fn_two_args_exact',
         execute: editIterable(false),
@@ -531,7 +570,7 @@ export const FUNCTIONS = defineFunctions({
     },
     str: {
         overloads: [
-            overload([value('value')], ['string']),
+            overload([value('value')], Types.string),
         ],
         kind: 'typeFunction',
         arityError: 'err_fn_one_arg_exact',
@@ -539,17 +578,17 @@ export const FUNCTIONS = defineFunctions({
     },
     num: {
         overloads: [
-            overload([value('value')], ['number']),
+            overload([value('value')], Types.number),
         ],
         kind: 'typeFunction',
         arityError: 'err_fn_one_arg_exact',
         execute: (values) => {
-            return Number(values[0]);
+            return Number(values[0] instanceof ScriptValue ? String(values[0]) : values[0]);
         },
     },
     int: {
         overloads: [
-            overload([value('value')], ['number']),
+            overload([value('value')], Types.number),
         ],
         kind: 'typeFunction',
         arityError: 'err_fn_one_arg_exact',
@@ -559,7 +598,7 @@ export const FUNCTIONS = defineFunctions({
     },
     bool: {
         overloads: [
-            overload([value('value')], ['bool']),
+            overload([value('value')], Types.bool),
         ],
         kind: 'typeFunction',
         arityError: 'err_fn_one_arg_exact',
@@ -567,7 +606,7 @@ export const FUNCTIONS = defineFunctions({
     },
     fragment: {
         overloads: [
-            overload([value('value')], ['fragment']),
+            overload([value('value')], Types.fragment),
         ],
         kind: 'typeFunction',
         arityError: 'err_fn_one_arg_exact',
@@ -575,7 +614,7 @@ export const FUNCTIONS = defineFunctions({
     },
     round: {
         overloads: [
-            overload([number('value')], ['number']),
+            overload([number('value')], Types.number),
         ],
         execute: (values) => {
             const v = values[0];
@@ -584,7 +623,7 @@ export const FUNCTIONS = defineFunctions({
     },
     ceil: {
         overloads: [
-            overload([number('value')], ['number']),
+            overload([number('value')], Types.number),
         ],
         execute: (values) => {
             const v = values[0];
@@ -593,7 +632,7 @@ export const FUNCTIONS = defineFunctions({
     },
     floor: {
         overloads: [
-            overload([number('value')], ['number']),
+            overload([number('value')], Types.number),
         ],
         execute: (values) => {
             const v = values[0];
@@ -602,7 +641,7 @@ export const FUNCTIONS = defineFunctions({
     },
     min: {
         overloads: [
-            overload([], ['number'], 1, Infinity, number('value')),
+            overload([], Types.number, 1, Infinity, number('value')),
         ],
         execute: (values) => {
             return Math.min(...values);
@@ -610,7 +649,7 @@ export const FUNCTIONS = defineFunctions({
     },
     max: {
         overloads: [
-            overload([], ['number'], 1, Infinity, number('value')),
+            overload([], Types.number, 1, Infinity, number('value')),
         ],
         execute: (values) => {
             return Math.max(...values);
@@ -621,15 +660,16 @@ export const FUNCTIONS = defineFunctions({
 export function overloadParameter(overload: FunctionOverload, index: number): FunctionParameter | undefined {
     return overload.parameters[index] ?? overload.restParameter;
 }
-export function formatTypeNames(types: ParameterTypes, elementTypes?: readonly ValueType[]): string[] {
+export function formatTypeNames(types: ParameterTypes | Type, elementTypes?: readonly ValueType[]): string[] {
+    if (types instanceof Type) return (types.descriptor instanceof UnionType ? (types.descriptor as UnionType).members : [types.descriptor]).map(type => type.format());
     return (types === 'any' ? ['any'] : types).map(type =>
         type === 'list' && elementTypes ? `list<${elementTypes.join(' | ') || 'unknown'}>` : type);
 }
 export function argumentTypeLabel(argument: OverloadArgument): string {
-    return formatTypeNames(argument.types, argument.elements ?? ['unknown']).join(' | ');
+    return formatTypeNames(argument.type ?? typeFromNames(argument.types, argument.elements ?? ['unknown'])).join(' | ');
 }
 export function parameterTypeLabel(parameter: FunctionParameter): string {
-    return formatTypeNames(parameter.types, parameter.elementTypes).join(' | ')
+    return formatTypeNames(parameter.type).join(' | ')
         + (parameter.requiredElementTypes?.length ? ' & contains<' + parameter.requiredElementTypes.join(' | ') + '>' : '');
 }
 function parameterMatch(parameter: FunctionParameter | undefined, type: ValueType, argument: OverloadArgument): { possible: boolean; certain: boolean } {
@@ -646,6 +686,7 @@ function parameterMatch(parameter: FunctionParameter | undefined, type: ValueTyp
 const actualTypes: readonly ValueType[] = ['string', 'number', 'bool', 'fragment', 'list', 'range', 'null', 'undefined'];
 export interface OverloadIssue { readonly index: number; readonly severity: 'error' | 'warning'; readonly expected: string; readonly actual: string }
 export function resolveFunctionOverloads(name: string, args: readonly OverloadArgument[]) {
+    args = args.map(argument => ({ ...argument, ...typeInfo(argument.type ?? typeFromNames(argument.types, argument.elements)), exactElements: argument.exactElements }));
     const spec = Object.prototype.hasOwnProperty.call(FUNCTIONS, name) ? FUNCTIONS[name] : undefined;
     if (!spec) return { candidates: [] as FunctionOverload[], fallback: [] as FunctionOverload[], issues: [] as OverloadIssue[] };
     let contexts: FunctionOverload[][] = [[...spec.overloads]];
@@ -706,8 +747,8 @@ export function validateFunction(name: string, count: number, malformed = false)
 // entrypoint. A union warning in the editor is checked against the actual value
 // here before invoking a builtin or handing control to a browser host.
 function runtimeArgument(value: unknown): OverloadArgument {
-    return { types: [valueTypeOf(value)], elements: Array.isArray(value) ? [...new Set(value.map(valueTypeOf))] : undefined,
-        exactElements: true, exactTypes: true };
+    const boxed = fromNative(value);
+    return { ...typeInfo(boxed.descriptor), exactElements: true, exactTypes: true };
 }
 export function validateFunctionArguments(name: string, values: readonly unknown[], ranges: readonly SourceRange[] = []): void {
     validateFunction(name, values.length);
@@ -718,7 +759,7 @@ export function validateFunctionArguments(name: string, values: readonly unknown
         const issue = resolution.issues.find(issue => issue.severity === 'error') ?? resolution.issues[0];
         if (issue) throw new SnippetError('err_argument_type', [name, String(issue.index + 1), issue.expected, issue.actual], ranges[issue.index]);
     }
-    FUNCTIONS[name].validate?.(values, ranges);
+    FUNCTIONS[name].validate?.(values.map(value => toNative(fromNative(value))), ranges);
 }
 
 

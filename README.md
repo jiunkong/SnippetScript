@@ -17,7 +17,7 @@ npm test
 ## Analyze once, execute repeatedly
 
 ```ts
-import { analyze, execute } from './dist/index.js';
+import { analyze, execute, fromNative } from './dist/index.js';
 
 const analysis = analyze('{{upper($name)}}{{#1}}', {
   variables: ['name'],
@@ -25,7 +25,7 @@ const analysis = analyze('{{upper($name)}}{{#1}}', {
 });
 
 const fragment = await execute(analysis, {
-  variables: { name: 'Guest' },
+  variables: { name: fromNative('Guest') },
   limits: { timeoutMs: 500, maxCallDepth: 32 },
 });
 
@@ -49,16 +49,22 @@ Compact blocks may nest and wrap conditionals or loops. They add no variable sco
 
 ## Variable type inference
 
-`analyze()` also returns `variableTypes`: `{ name, range, types, elementTypes? }` entries for variable reads, assignment targets, and loop `index`/`value` expressions. Ranges use the original source, including inside backtick fragments. `types` contains language names (`string`, `number`, `bool`, `fragment`, `list`, `range`, `null`, `undefined`) or `unknown` when a type cannot be determined. Optional `elementTypes` describes possible list element types, merged across repeated analysis of the same occurrence. Hosts can display `list<string | number>` without changing the underlying `list` value type. Assignment targets show the assigned type; later reads reflect the assignments that can reach that position. Assignments remain dynamically typed. The same inference pass checks function arguments and cursor expressions and adds type diagnostics to `Analysis.diagnostics`.
+All script values now derive from `Type` through `ScriptValue`: `StringValue`, `NumberValue`, `BoolValue`, `NullValue`, `UndefinedValue`, `ListValue`, `RangeValue`, and `SnippetFragment`. AST literals, variable scopes, list elements, expression results and host arguments carry these immutable objects. `evaluateExpression()` returns a `ScriptValue`. Native inputs are converted at execution boundaries with `fromNative()`; browser adapters use `toNative()` before calling native APIs and wrap their results with `fromNative()`. Implicit numeric/default coercion of value objects throws. The native builtin computation adapter unwraps arguments and wraps its results; it never owns script scopes or AST values.
 
-Names supplied through `variables` start as `string`, matching trigger captures. Hosts with known non-string inputs may supply `variableTypes: { name: ['number'] }` instead (or override a name in `variables`). For example:
+Type descriptions also derive from `Type`: atomic descriptions, `ListType`, `UnionType`, `UnknownType`, `AnyType` and `NeverType`. Every value exposes its description through `.descriptor`. `UnionType.of()` flattens nested unions, deduplicates and orders members, absorbs unknown/any, and removes never. Nested lists retain their element descriptions. `Type.accepts()` and `Type.equals()` compare descriptions structurally. Union descriptions are analysis utilities and cannot be inserted into runtime scopes as values. Flow joins conservatively widen deeply recursive list shapes to unknown so recursive assignments cannot expand analysis indefinitely. Structural identities deduplicate types without rendering them; boundary codecs preserve shared immutable lists rather than copying their entire expanded shape.
+
+The authoritative analysis fields are `variableTypes[i].type`, `callTypes[i].type`, `parameters[i].type` and `overloads[i].returnType`. Hosts should format these objects with `formatTypeNames(type)` or `type.format()`. The older type-name arrays remain compatibility views for existing presentation clients, not the stored union representation.
+
+`analyze()` also returns `variableTypes`: `{ name, range, type, types, elementTypes? }` entries for variable reads, assignment targets, and loop `index`/`value` expressions. Ranges use the original source, including inside backtick fragments. `types` contains language names (`string`, `number`, `bool`, `fragment`, `list`, `range`, `null`, `undefined`) or `unknown` when a type cannot be determined. Optional `elementTypes` describes possible list element types, merged across repeated analysis of the same occurrence. Hosts can display `list<string | number>` without changing the underlying `list` value type. Assignment targets show the assigned type; later reads reflect the assignments that can reach that position. Assignments remain dynamically typed. The same inference pass checks function arguments and cursor expressions and adds type diagnostics to `Analysis.diagnostics`.
+
+Names supplied through `variables` start as `string`, matching trigger captures. Hosts with known non-string inputs may supply `variableTypes: { name: Types.number }` instead (or override a name in `variables`). For example:
 
 ```ts
 const analysis = analyze('{{ $n }}{{set $n=int($n)}}{{ $n }}', { variables: ['n'] });
 // The first read is string, the assignment target and final read are number.
 ```
 
-The pass walks the shared AST without executing expressions or host requests. Branch exits merge possible types; loops propagate types from prior iterations until stable and account for zero iterations, break and continue. Existing variables retain assignments made in nested blocks; variables introduced inside those blocks stay local. Fragment literals are analyzed in a copied scope, and snippet calls return `fragment`. Iterable element types propagate to `value` and indexing; indexing includes `undefined` because an index may be out of bounds. Nested list contents or other insufficiently known inputs can yield `unknown`. Inference is conservative: conditions are not narrowed by their runtime values, so hover types can include alternatives that a particular execution does not take.
+The pass walks the shared AST without executing expressions or host requests. Branch exits merge possible types; loops propagate types from prior iterations until stable and account for zero iterations, break and continue. Existing variables retain assignments made in nested blocks; variables introduced inside those blocks stay local. Fragment literals are analyzed in a copied scope, and snippet calls return `fragment`. Iterable element types propagate to `value` and indexing; indexing includes `undefined` because an index may be out of bounds. Nested list element descriptions are retained; insufficiently known inputs can yield `unknown`. Inference is conservative: conditions are not narrowed by their runtime values, so hover types can include alternatives that a particular execution does not take.
 
 Hosts may expose this information as hovers without attaching presentation to token kinds. `inferVariableTypes(template, options)` is also exported for consumers that already hold a parsed template.
 
@@ -154,7 +160,7 @@ Add one entry to `defineFunctions({...})` in `src/functions.ts`. No builtin-name
 ```ts
 // Inside the registry:
 example: {
-    overloads: [overload([string('text')], ['string'])],
+    overloads: [overload([string('text')], Types.string)],
     execute: ([text]) => text.toUpperCase(),
 },
 ```
@@ -166,7 +172,7 @@ example: {
 - `kind` controls the semantic function token category. The host maps categories to colors.
 - Host entries use `host()` and `host: true`; `userInput: true` excludes input waits from the deadline and treats empty/null responses as cancellation. Result normalization and failure policies are declared in that entry.
 
-The runtime supplies `environment`, execution checks, `invokeHost(values)` and `solveFragment(source)`. Function definitions choose which capabilities to use; the runtime has no branches for specific builtins. Browser code stays outside the core, and adding a new browser capability requires implementing that capability in the host. `values.ts` preserves the public synchronous builtin API, while `value-operations.ts` contains independent value algebra and has no dependency on the registry.
+The runtime supplies `environment`, execution checks, `invokeHost(values)` and `solveFragment(source)`. Function definitions choose which capabilities to use; the runtime has no branches for specific builtins. Browser code stays outside the core, and adding a new browser capability requires implementing that capability in the host. `values.ts` preserves the public synchronous builtin API, while `value-operations.ts` exposes object-only value algebra; `native-values.ts` implements the isolated native computation adapter. Neither depends on the registry.
 
 User-input waits (`prompt` and `choice`) are excluded from the shared timeout. Clipboard and other host waits count. Empty/null input cancels expansion with `SnippetPromptCancelled`. `copy` reports failures; failed clipboard reads preserve the existing empty-string behavior. Timeouts and explicit cancellation abort the host signal, ignore late results, and stop execution. Hosts are responsible for any cancellation their external API supports; already completed external side effects are not rolled back.
 

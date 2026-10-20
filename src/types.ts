@@ -1,5 +1,6 @@
 import type { FunctionParameter, ParameterTypes, OverloadArgument } from './functions.js';
-import type { SnippetFragment } from './fragment.js';
+import type { ScriptValue, Type, TypeName } from './type-system.js';
+export type { RangeValue } from './type-system.js';
 import type { SnippetTemplate } from './analyzer.js';
 export interface ExecutionCheck {
     check(): void;
@@ -33,29 +34,27 @@ export interface Snippet {
     replacement?: string;
     disabled?: boolean;
 }
-export interface RangeValue {
-    readonly type: 'range';
-    readonly start: number;
-    readonly end: number;
-}
-export type Value = string | number | boolean | null | undefined | SnippetFragment | RangeValue | readonly Value[];
+export type Value = ScriptValue;
 export type Variables = Record<string | symbol, Value>;
-export type ValueType = 'string' | 'number' | 'bool' | 'fragment' | 'list' | 'range' | 'null' | 'undefined' | 'unknown';
+export type ValueType = TypeName;
 export interface VariableTypeInfo {
     readonly name: string;
     readonly range: SourceRange;
+    readonly type: Type;
     readonly types: readonly ValueType[];
     readonly elementTypes?: readonly ValueType[];
 }
 export interface CallTypeInfo {
     readonly argumentTypes?: readonly OverloadArgument[];
     readonly range: SourceRange;
+    readonly type: Type;
     readonly types: readonly ValueType[];
     readonly elementTypes?: readonly ValueType[];
 }
 export interface CallableOverload {
     readonly id: string;
     readonly parameters: readonly (FunctionParameter & { readonly optional?: boolean; readonly rest?: boolean })[];
+    readonly returnType: Type;
     readonly returnTypes: ParameterTypes;
     readonly returnElementTypes?: readonly ValueType[];
 }
@@ -98,7 +97,7 @@ export interface TriggerAnalysis extends Omit<Analysis, 'template' | 'variableTy
 export interface AnalyzeOptions {
     library?: readonly Snippet[] | null;
     variables?: readonly string[];
-    variableTypes?: Readonly<Record<string, readonly ValueType[]>>;
+    variableTypes?: Readonly<Record<string, Type | readonly ValueType[]>>;
     forDepth?: number;
     checkVariables?: boolean;
 }

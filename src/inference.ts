@@ -1,4 +1,4 @@
-import { Type, Types, ListType, NumberValue, UnionType, typeFromNames, typeInfo } from './type-system.js';
+import { Type, Types, ListType, NumberValue, UnionType, intersectTypes, excludeType, typeFromNames, typeInfo } from './type-system.js';
 import { FUNCTIONS, SNIPPET_PARAMETER_TYPES, argumentTypeLabel, resolveFunctionOverloads } from './functions.js';
 import type { AnalyzeOptions, CallTypeInfo, Diagnostic, Expr, SourceRange, ValueType, VariableTypeInfo } from './types.js';
 import type { SnippetTemplate } from './analyzer.js';
@@ -130,6 +130,24 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
         const view = typeInfo(type);
         occurrences.set(key, { name, range, type, types: view.types, elementTypes: view.elements });
     }
+    const loopValueKey = '\0value'; // Reserved loop value is distinct from $value.
+    function narrowed(scope: Scope | undefined, node: Expr, truth: boolean): Scope | undefined {
+        if (!scope) return undefined;
+        if (node.kind === 'unary' && node.operator === '!') return narrowed(scope, node.operand, !truth);
+        if (node.kind === 'binary' && (node.operator === '&&' || node.operator === '||')) {
+            const and = node.operator === '&&';
+            if (truth === and) return narrowed(narrowed(scope, node.left, truth), node.right, truth);
+            return merge([narrowed(scope, node.left, truth), narrowed(narrowed(scope, node.left, !truth), node.right, truth)]
+                .filter((path): path is Scope => !!path));
+        }
+        if (node.kind !== 'typeTest' || node.operand.kind !== 'variable' && node.operand.kind !== 'loop') return new Map(scope);
+        const name = node.operand.kind === 'loop' && node.operand.name === 'value' ? loopValueKey : node.operand.name;
+        const previous = scope.get(name) ?? unknown();
+        const type = truth ? intersectTypes(previous.type, node.target) : excludeType(previous.type, node.target);
+        if (type.kind === 'never') return undefined;
+        const next = new Map(scope); next.set(name, typeInfo(type));
+        return next;
+    }
     function expression(node: Expr, scope: Scope, loopValue?: Info): Info {
         switch (node.kind) {
             case 'literal': return typeInfo(node.value.descriptor);
@@ -137,7 +155,7 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
                 const value = scope.get(node.name) ?? unknown(); record(node.name, node.range, value); return value;
             }
             case 'loop': {
-                const value = node.name === 'index' ? info('number') : loopValue ?? unknown();
+                const value = scope.get(node.name === 'value' ? loopValueKey : 'index') ?? (node.name === 'index' ? info('number') : loopValue ?? unknown());
                 record(node.name, node.range, value); return value;
             }
             case 'fragment': block(node.template, new Map(scope), loopValue); return info('fragment');
@@ -154,11 +172,23 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
                 const target = expression(node.target, scope, loopValue); expression(node.index, scope, loopValue);
                 return typeInfo(UnionType.of(itemType(target.type), Types.undefined));
             }
-            case 'unary': expression(node.operand, scope, loopValue); return info('number');
-            case 'binary':
+            case 'unary': expression(node.operand, scope, loopValue); return info(node.operator === '!' ? 'bool' : 'number');
+            case 'typeTest': expression(node.operand, scope, loopValue); return info('bool');
+            case 'binary': {
                 checkDivisor(node.operator, node.right);
+                if (node.operator === '&&' || node.operator === '||') {
+                    expression(node.left, scope, loopValue);
+                    const right = narrowed(scope, node.left, node.operator === '&&');
+                    if (right) expression(node.right, right, loopValue);
+                    return info('bool');
+                }
                 return binary(node.operator, expression(node.left, scope, loopValue), expression(node.right, scope, loopValue));
-            case 'conditional': expression(node.condition, scope, loopValue); return union(expression(node.yes, scope, loopValue), expression(node.no, scope, loopValue));
+            }
+            case 'conditional': {
+                expression(node.condition, scope, loopValue);
+                const yes = narrowed(scope, node.condition, true), no = narrowed(scope, node.condition, false);
+                return union(...[yes && expression(node.yes, yes, loopValue), no && expression(node.no, no, loopValue)].filter((value): value is Info => !!value));
+            }
             case 'call': {
                 const args = node.args.map(arg => expression(arg, scope, loopValue));
                 return recordCall(node.range, builtin(node.name, args), node.name, args, node.args.map(arg => arg.range));
@@ -189,13 +219,18 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
                 case 'continue': continues.push(scope); scope = undefined; break;
                 case 'if': {
                     const paths: Scope[] = [];
+                    let remaining: Scope | undefined = scope;
                     for (const branch of node.branches) {
-                        if (branch.expression) expression(branch.expression, scope, loopValue);
-                        const flow = block(branch.body, scope, loopValue);
+                        if (!remaining) break;
+                        if (branch.expression) expression(branch.expression, remaining, loopValue);
+                        const selected = branch.expression ? narrowed(remaining, branch.expression, true) : remaining;
+                        remaining = branch.expression ? narrowed(remaining, branch.expression, false) : undefined;
+                        if (!selected) continue;
+                        const flow = block(branch.body, selected, loopValue);
                         if (flow.normal) paths.push(flow.normal);
                         breaks.push(...flow.breaks); continues.push(...flow.continues);
                     }
-                    if (node.branches.every(branch => branch.expression !== null)) paths.push(scope);
+                    if (remaining) paths.push(remaining);
                     scope = merge(paths); break;
                 }
                 case 'switch': {
@@ -217,7 +252,7 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
                 case 'for': {
                     const iterable = expression(node.expression, scope, loopValue);
                     const item = typeInfo(itemType(iterable.type));
-                    const entry = new Map(scope); entry.set('index', info('number'));
+                    const entry = new Map(scope); entry.set('index', info('number')); entry.set(loopValueKey, item);
                     let head = entry;
                     const exits: Scope[] = [scope]; // The loop may execute zero times.
                     // Type sets are finite; iterate until assignments from earlier
@@ -233,6 +268,7 @@ export function inferTemplateTypes(template: SnippetTemplate, options: AnalyzeOp
                     }
                     const merged = merge(exits)!;
                     if (scope.has('index')) merged.set('index', scope.get('index')!); else merged.delete('index');
+                    if (scope.has(loopValueKey)) merged.set(loopValueKey, scope.get(loopValueKey)!); else merged.delete(loopValueKey);
                     scope = merged; break;
                 }
             }

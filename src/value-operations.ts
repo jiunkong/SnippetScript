@@ -1,10 +1,10 @@
 import * as native from './native-values.js';
 import { fromNative, toNative } from './value-codec.js';
-import { ScriptValue, ListValue, RangeValue } from './type-system.js';
+import { ScriptValue, ListValue, RangeValue, BoolValue } from './type-system.js';
 import type { ExecutionCheck } from './types.js';
 export { isRange } from './value-type.js';
 export function checkNumberResult<T>(value: T): T { native.checkNumberResult(value instanceof ScriptValue ? toNative(value) : value); return value; }
-export function unaryValue(operator: string, value: ScriptValue): ScriptValue { return fromNative(native.unaryValue(operator, toNative(value))); }
+export function unaryValue(operator: string, value: ScriptValue): ScriptValue { return operator === '!' ? new BoolValue(!snippetBooleanValue(value)) : fromNative(native.unaryValue(operator, toNative(value))); }
 export function binaryValue(operator: string, left: ScriptValue, right: ScriptValue, execution?: ExecutionCheck): ScriptValue {
     return fromNative(native.binaryValue(operator, toNative(left), toNative(right), execution));
 }

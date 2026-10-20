@@ -9,7 +9,7 @@ export interface SourceRange {
     readonly start: number;
     readonly end: number;
 }
-export type TokenKind = 'syntax' | 'parenthesis' | 'keyword' | 'variable' | 'function' | 'randomFunction' | 'typeFunction' | 'snippetFunction' | 'operator' | 'arithmeticOperator' | 'rangeOperator' | 'list' | 'fragmentDelimiter' | 'cursorSyntax' | 'cursor' | 'regex' | 'regexFlag' | 'bool' | 'null' | 'stringEscape';
+export type TokenKind = 'syntax' | 'parenthesis' | 'keyword' | 'variable' | 'type' | 'function' | 'randomFunction' | 'typeFunction' | 'snippetFunction' | 'operator' | 'arithmeticOperator' | 'rangeOperator' | 'list' | 'fragmentDelimiter' | 'cursorSyntax' | 'cursor' | 'regex' | 'regexFlag' | 'bool' | 'null' | 'stringEscape';
 export interface HighlightToken extends SourceRange {
     readonly kind: TokenKind;
 }
@@ -150,6 +150,10 @@ export type Expr = Readonly<({
     kind: 'unary';
     operator: string;
     operand: Expr;
+} | {
+    kind: 'typeTest';
+    operand: Expr;
+    target: Type;
 } | {
     kind: 'binary';
     operator: string;

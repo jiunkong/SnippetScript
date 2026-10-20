@@ -1,5 +1,5 @@
 import { fromNative, toNative } from './value-codec.js';
-import { NumberValue, StringValue, Types } from './type-system.js';
+import { NumberValue, StringValue, Type, Types, ListType, UnionType } from './type-system.js';
 import { inferTemplateTypes } from './inference.js';
 import { snippetParameterNames } from './trigger.js';
 export { analyzeTrigger } from './trigger.js';
@@ -43,7 +43,7 @@ function report(state: State, error: any, fallback: SourceRange) {
     state.diagnostics.push(Object.freeze({ code, args: Object.freeze(error.args || error.messageValues || []), severity: 'error', range: Object.freeze(range) }));
 }
 function fail(code: string, range: SourceRange, args: unknown[] = []): never { throw new SnippetError(code, args, range); }
-const precedences: Record<string, number> = { '~': 1, '||': 2, '&&': 3, '==': 4, '!=': 4, '>': 4, '<': 4, '>=': 4, '<=': 4, '+': 5, '-': 5, '*': 6, '/': 6, '%': 6 };
+const precedences: Record<string, number> = { '~': 1, '||': 2, '&&': 3, '==': 4, '!=': 4, '>': 4, '<': 4, '>=': 4, '<=': 4, is: 4, '+': 5, '-': 5, '*': 6, '/': 6, '%': 6 };
 interface Lex {
     text: string;
     start: number;
@@ -136,12 +136,60 @@ class ExpressionParser {
                 fail('err_range_both_values_required', this.range(next.start, next.end), [this.text]);
             this.advance();
             this.mark(next, next.text === '~' ? 'rangeOperator' : ['+', '-', '*', '/', '%'].includes(next.text) ? 'arithmeticOperator' : 'operator');
+            if (next.text === 'is') {
+                const target = this.typeExpression();
+                left = { kind: 'typeTest', operand: left, target: target.type, range: { start: left.range.start, end: target.end } };
+                continue;
+            }
             if (['', ')', ']', ',', ':', '~'].includes(this.current.text))
                 fail(next.text === '~' ? 'err_range_both_values_required' : 'err_missing_operand', this.range(next.start, next.end), [this.text]);
             const right = this.parse(precedence + 1);
             left = { kind: 'binary', operator: next.text, left, right, range: { start: left.range.start, end: right.range.end } };
         }
         return left;
+    }
+    typeExpression(depth = 0): { type: Type; end: number } {
+        if (depth > 128) fail('err_type_syntax', this.range(this.current.start, this.current.end));
+        const members: Type[] = [];
+        let end = 0;
+        do {
+            if (members.length) this.mark(this.advance(), 'operator');
+            const item = this.advance();
+            if (item.text === '(') {
+                this.mark(item, 'parenthesis');
+                const nested = this.typeExpression(depth + 1);
+                const close = this.expected(')', 'err_type_syntax');
+                this.mark(close, 'parenthesis');
+                members.push(nested.type); end = this.range(close.start, close.end).end;
+            } else {
+                if (item.type !== 'identifier') fail('err_type_syntax', this.range(item.start, item.end));
+                this.mark(item, 'type');
+                if (item.text === 'list') {
+                    let element: Type = Types.any;
+                    end = this.range(item.start, item.end).end;
+                    if (this.at('<')) {
+                        this.mark(this.advance(), 'parenthesis');
+                        element = this.typeExpression(depth + 1).type;
+                        // In a type, the first character of >= closes list<T>.
+                        // Leave the following = for the ordinary expression lexer.
+                        if (this.at('>=')) {
+                            const close = this.current;
+                            this.mark({ ...close, end: close.start + 1 }, 'parenthesis');
+                            end = this.range(close.start, close.start + 1).end;
+                            this.position = close.start + 1; this.current = this.next();
+                        } else {
+                            const close = this.expected('>', 'err_type_syntax');
+                            this.mark(close, 'parenthesis'); end = this.range(close.start, close.end).end;
+                        }
+                    }
+                    members.push(new ListType(element));
+                } else {
+                    if (!own(Types, item.text)) fail('err_unknown_type', this.range(item.start, item.end), [item.text]);
+                    members.push(Types[item.text as keyof typeof Types]); end = this.range(item.start, item.end).end;
+                }
+            }
+        } while (this.at('|'));
+        return { type: UnionType.of(...members), end };
     }
     arguments(close: string, errorCode: string): Expr[] {
         const items: Expr[] = [];
@@ -238,8 +286,8 @@ class ExpressionParser {
             this.mark(close, 'list');
             return { kind: 'list', items, range: { start: range.start, end: this.range(close.start, close.end).end } };
         }
-        if (item.text === '+' || item.text === '-') {
-            this.mark(item, 'arithmeticOperator');
+        if (item.text === '+' || item.text === '-' || item.text === '!') {
+            this.mark(item, item.text === '!' ? 'operator' : 'arithmeticOperator');
             const operand = this.parse(7);
             return { kind: 'unary', operator: item.text, operand, range: { start: range.start, end: operand.range.end } };
         }

@@ -10,9 +10,7 @@ export interface FunctionParameter {
     readonly type: Type;
     readonly name: string;
     readonly types: ParameterTypes;
-    readonly requiredType?: Type;
     readonly elementTypes?: readonly ValueType[];
-    readonly requiredElementTypes?: readonly ValueType[];
 }
 export interface FunctionOverload {
     readonly id: string;
@@ -80,15 +78,13 @@ const text = UnionType.of(Types.string, Types.fragment);
 function declaredType(source: ParameterTypes | Type): Type {
     return source instanceof Type ? source : source === 'any' ? Types.any : typeFromNames(source);
 }
-function parameter(name: string, source: ParameterTypes | Type, elements?: readonly ValueType[] | Type, required?: readonly ValueType[] | Type): FunctionParameter {
+function parameter(name: string, source: ParameterTypes | Type, elements?: readonly ValueType[] | Type): FunctionParameter {
     const element = elements && (elements instanceof Type ? elements : typeFromNames(elements));
     const base = declaredType(source);
     const type = base.kind === 'list' && element ? new ListType(element) : base;
-    const requiredType = required && (required instanceof Type ? required : typeFromNames(required));
-    return Object.freeze({ name, type, requiredType,
+    return Object.freeze({ name, type,
         get types() { return type.kind === 'any' ? 'any' as const : type.names; },
         get elementTypes() { return element?.names; },
-        get requiredElementTypes() { return requiredType?.names; },
     });
 }
 const string = (name: string) => parameter(name, Types.string);
@@ -524,8 +520,15 @@ export const FUNCTIONS = defineFunctions({
         overloads: [
             overload([parameter('list', new ListType(Types.unknown), Types.string), string('separator')], Types.string),
             overload([parameter('list', new ListType(Types.unknown), text), parameter('separator', Types.fragment)], Types.fragment),
-            overload([parameter('list', new ListType(Types.unknown), text, Types.fragment), string('separator')], Types.fragment),
+            overload([parameter('list', new ListType(Types.unknown), text), string('separator')], text),
         ],
+        inferReturn: (args, overloads) => {
+            // An element union describes possible items, not their presence.
+            // Only the all-string case can narrow the broad overload to string.
+            if (args[0] && args[1] && new ListType(Types.string).accepts(args[0].type) && Types.string.accepts(args[1].type))
+                return typeInfo(Types.string);
+            return typeInfo(UnionType.of(...overloads.map(overload => overload.returnType)));
+        },
         arityError: 'err_fn_two_args_exact',
         execute: (values, { execution }) => {
             const value = values[0];
@@ -669,8 +672,7 @@ export function argumentTypeLabel(argument: OverloadArgument): string {
     return formatTypeNames(argument.type ?? typeFromNames(argument.types, argument.elements ?? ['unknown'])).join(' | ');
 }
 export function parameterTypeLabel(parameter: FunctionParameter): string {
-    return formatTypeNames(parameter.type).join(' | ')
-        + (parameter.requiredElementTypes?.length ? ' & contains<' + parameter.requiredElementTypes.join(' | ') + '>' : '');
+    return formatTypeNames(parameter.type).join(' | ');
 }
 function parameterMatch(parameter: FunctionParameter | undefined, type: ValueType, argument: OverloadArgument): { possible: boolean; certain: boolean } {
     if (!parameter || parameter.types !== 'any' && !parameter.types.includes(type)) return { possible: false, certain: false };
@@ -680,8 +682,7 @@ function parameterMatch(parameter: FunctionParameter | undefined, type: ValueTyp
     const allowed = elements.filter(type => parameter.elementTypes!.includes(type));
     const valid = !unknown && allowed.length === elements.length;
     if (!valid && (argument.exactElements || !unknown && !allowed.length)) return { possible: false, certain: false };
-    if (parameter.requiredElementTypes?.some(type => !elements.includes(type)) && !unknown) return { possible: false, certain: false };
-    return { possible: true, certain: valid && (!parameter.requiredElementTypes?.length || !!argument.exactElements) };
+    return { possible: true, certain: valid };
 }
 const actualTypes: readonly ValueType[] = ['string', 'number', 'bool', 'fragment', 'list', 'range', 'null', 'undefined'];
 export interface OverloadIssue { readonly index: number; readonly severity: 'error' | 'warning'; readonly expected: string; readonly actual: string }

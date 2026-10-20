@@ -25,14 +25,7 @@ export abstract class Type {
     get identity(): number { return typeIdentity(this); }
     equals(other: Type): boolean { return this.identity === other.identity; }
     union(other: Type): Type { return UnionType.of(this.descriptor, other.descriptor); }
-    accepts(other: Type): boolean {
-        if (this.descriptor !== this) return this.descriptor.accepts(other.descriptor);
-        if (this.kind === 'any' || this.kind === 'unknown' || other.kind === 'never') return true;
-        if (other instanceof UnionType) return other.members.every(member => this.accepts(member));
-        if (this instanceof UnionType) return this.members.some(member => member.accepts(other));
-        if (this instanceof ListType && other.descriptor instanceof ListType) return this.element.accepts((other.descriptor as ListType).element);
-        return this.kind === other.kind;
-    }
+    accepts(other: Type, execution?: { check(): void }): boolean { return acceptsType(this.descriptor, other.descriptor, execution); }
     get names(): readonly TypeName[] {
         return Object.freeze(this instanceof UnionType ? order.filter(name => this.members.some(member => member.kind === name))
             : this.kind === 'any' ? ['unknown'] as TypeName[] : this.kind === 'never' ? [] : [this.kind as TypeName]);
@@ -97,6 +90,44 @@ export const Types = Object.freeze({
     range: new RangeType(), null: new NullType(), undefined: new UndefinedType(), unknown: new UnknownType(),
     any: new AnyType(), never: new NeverType(),
 });
+function acceptsType(target: Type, source: Type, execution?: { check(): void }, seen = new Map<Type, Map<Type, boolean>>()): boolean {
+    execution?.check();
+    const cached = seen.get(target)?.get(source);
+    if (cached !== undefined) return cached;
+    const result = target.kind === 'any' || target.kind === 'unknown' || source.kind === 'never' ? true
+        : source instanceof UnionType ? source.members.every(member => acceptsType(target, member, execution, seen))
+        : target instanceof UnionType ? target.members.some(member => acceptsType(member, source, execution, seen))
+        : target instanceof ListType && source instanceof ListType ? acceptsType(target.element, source.element, execution, seen)
+        : target.kind === source.kind;
+    if (!seen.has(target)) seen.set(target, new Map());
+    seen.get(target)!.set(source, result);
+    return result;
+}
+/** The values that can satisfy both descriptions, including empty list overlap. */
+export function intersectTypes(source: Type, target: Type, seen = new Map<string, Type>()): Type {
+    source = source.descriptor; target = target.descriptor;
+    const key = `${source.identity}:${target.identity}`;
+    const cached = seen.get(key);
+    if (cached) return cached;
+    const result = source.kind === 'never' || target.kind === 'never' ? Types.never
+        : source.kind === 'any' || source.kind === 'unknown' ? target
+        : target.kind === 'any' || target.kind === 'unknown' ? source
+        : source.equals(target) ? source
+        : source instanceof UnionType ? UnionType.of(...source.members.map(member => intersectTypes(member, target, seen)))
+        : target instanceof UnionType ? UnionType.of(...target.members.map(member => intersectTypes(source, member, seen)))
+        : source instanceof ListType && target instanceof ListType ? new ListType(intersectTypes(source.element, target.element, seen))
+        : source.kind === target.kind ? source : Types.never;
+    seen.set(key, result);
+    return result;
+}
+/** Keep partial overlaps when their complement cannot be expressed safely. */
+export function excludeType(source: Type, target: Type): Type {
+    source = source.descriptor; target = target.descriptor;
+    if (target.accepts(source)) return Types.never;
+    if (source instanceof UnionType) return UnionType.of(...source.members.map(member => excludeType(member, target)));
+    if (target instanceof UnionType) return target.members.reduce((remaining, member) => excludeType(remaining, member), source);
+    return source;
+}
 export function typeFromNames(names: readonly TypeName[], elements?: readonly TypeName[]): Type {
     return UnionType.of(...names.map(name => name === 'list' ? new ListType(elements ? typeFromNames(elements) : Types.unknown) : Types[name]));
 }

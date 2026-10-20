@@ -142,6 +142,7 @@ async function evaluate(node: Expr, args: Variables, context: Context): Promise<
                 return createList(values);
             }
             case 'index': return indexValue(await evaluate(node.target, args, context), await evaluate(node.index, args, context), execution);
+            case 'typeTest': return new BoolValue(node.target.accepts((await evaluate(node.operand, args, context)).descriptor, execution));
             case 'unary': {
                 const value = await evaluate(node.operand, args, context);
                 return unaryValue(node.operator, value);
@@ -424,6 +425,7 @@ function evaluatePure(node: Expr, args: Variables, execution: any, environment: 
         case 'loop': return variable(node, args);
         case 'list': return createList(node.items.map(evalNode));
         case 'index': return indexValue(evalNode(node.target), evalNode(node.index), execution);
+        case 'typeTest': return new BoolValue(node.target.accepts(evalNode(node.operand).descriptor, execution));
         case 'unary': return unaryValue(node.operator, evalNode(node.operand));
         case 'conditional': return evalNode(snippetConditionValue(evalNode(node.condition)) ? node.yes : node.no);
         case 'binary': {
